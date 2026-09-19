@@ -24,6 +24,113 @@ namespace videoout
 		int    s_pushed  = 0;         // frames handed over
 		char   s_outPath[MAX_PATH]{};
 
+		// The renderer still uses render_NNNN as a TEMPORARY working folder.
+		// On a successful video render the finished file is published one level
+		// up, using the Rockstar Editor project name, then the temporary folder
+		// is removed when it is empty. Failed/cancelled renders stay in their
+		// numbered folder so diagnostics and any partial output are not lost.
+		std::string s_renderFolder;
+		std::string s_projectStem;
+		std::string s_outExt;
+
+		std::string safeFileStem(const char* raw)
+		{
+			std::string out = (raw && *raw) ? raw : "Wow Render";
+
+			for (char& ch : out)
+			{
+				const unsigned char c = (unsigned char)ch;
+				if (c < 0x20 || ch == '<' || ch == '>' || ch == ':' ||
+				    ch == '"' || ch == '/' || ch == '\\' || ch == '|' ||
+				    ch == '?' || ch == '*')
+					ch = '_';
+			}
+
+			// Windows silently drops trailing dots/spaces from filenames.
+			while (!out.empty() && (out.back() == '.' || out.back() == ' '))
+				out.pop_back();
+
+			return out.empty() ? std::string("Wow Render") : out;
+		}
+
+		std::string parentFolder(const std::string& path)
+		{
+			const size_t slash = path.find_last_of("\\/");
+			return slash == std::string::npos ? std::string() : path.substr(0, slash);
+		}
+
+		std::string uniqueProjectOutput(const std::string& base,
+		                               const std::string& stem,
+		                               const std::string& ext)
+		{
+			auto make = [&](int n) {
+				char suffix[32]{};
+				if (n > 0) snprintf(suffix, sizeof(suffix), "_%02d", n);
+				return base + "\\" + stem + suffix + "." + ext;
+			};
+
+			for (int n = 0; n < 10000; ++n)
+			{
+				const std::string p = make(n);
+				if (GetFileAttributesA(p.c_str()) == INVALID_FILE_ATTRIBUTES)
+					return p;
+			}
+
+			// Practically unreachable, but never overwrite a finished export.
+			char suffix[48]{};
+			snprintf(suffix, sizeof(suffix), "_%lu", GetTickCount());
+			return base + "\\" + stem + suffix + "." + ext;
+		}
+
+		void publishFinishedVideo()
+		{
+			if (s_renderFolder.empty() || s_projectStem.empty() ||
+			    s_outExt.empty() || !s_outPath[0])
+				return;
+
+			const std::string base = parentFolder(s_renderFolder);
+			if (base.empty()) return;
+
+			const std::string finalPath =
+				uniqueProjectOutput(base, s_projectStem, s_outExt);
+
+			if (!MoveFileExA(s_outPath, finalPath.c_str(),
+			                 MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH))
+			{
+				logger::write("info",
+					"video: finished, but could not publish '%s' as '%s' (error %lu) - "
+					"keeping the numbered render folder",
+					s_outPath, finalPath.c_str(), GetLastError());
+				return;
+			}
+
+			logger::write("info", "video: published final export -> %s",
+				finalPath.c_str());
+			snprintf(s_outPath, sizeof(s_outPath), "%s", finalPath.c_str());
+
+			if (!Config::get().renderKeepFrames)
+			{
+				// The audio pass is already muxed into the finished video.
+				DeleteFileA((s_renderFolder + "\\audio.wav").c_str());
+				DeleteFileA((s_renderFolder + "\\assemble.txt").c_str());
+
+				// Frames are deleted as they are fed to ffmpeg when KeepFrames=0,
+				// so a successful normal video render should now be empty.
+				// If something unexpected remains, leave the folder alone rather
+				// than recursively deleting data we did not create here.
+				if (!RemoveDirectoryA(s_renderFolder.c_str()))
+				{
+					const DWORD e = GetLastError();
+					if (e != ERROR_DIR_NOT_EMPTY &&
+					    e != ERROR_FILE_NOT_FOUND &&
+					    e != ERROR_PATH_NOT_FOUND)
+						logger::write("info",
+							"video: final file published, temporary folder could not "
+							"be removed (error %lu): %s", e, s_renderFolder.c_str());
+				}
+			}
+		}
+
 		// ffmpeg's own stdout and stderr, and a thread that does nothing but
 		// empty them.
 		//
@@ -142,6 +249,14 @@ namespace videoout
 			  "Near-lossless H.264. Plays anywhere. The safe default." },
 			{ "h264_upload",      "mp4", "-c:v libx264 -crf 20 -preset slow -pix_fmt yuv420p" COL,
 			  "Smaller H.264 for uploading, where the site re-encodes anyway." },
+			{ "h264_80mbps",      "mp4", "-c:v libx264 -b:v 80M -maxrate 96M -bufsize 160M -preset slow -pix_fmt yuv420p" COL,
+			  "H.264 master at 80 Mbps target / 96 Mbps peak." },
+			{ "h264_100mbps",     "mp4", "-c:v libx264 -b:v 100M -maxrate 120M -bufsize 200M -preset slow -pix_fmt yuv420p" COL,
+			  "H.264 master at 100 Mbps target / 120 Mbps peak." },
+			{ "h264_120mbps",     "mp4", "-c:v libx264 -b:v 120M -maxrate 144M -bufsize 240M -preset slow -pix_fmt yuv420p" COL,
+			  "H.264 master at 120 Mbps target / 144 Mbps peak." },
+			{ "h264_150mbps",     "mp4", "-c:v libx264 -b:v 150M -maxrate 180M -bufsize 300M -preset slow -pix_fmt yuv420p" COL,
+			  "H.264 master at 150 Mbps target / 180 Mbps peak." },
 			{ "h265",             "mp4", "-c:v libx265 -crf 20 -preset slow -pix_fmt yuv420p" COL,
 			  "Similar quality at roughly half the size, slower to encode." },
 			{ "av1",              "mkv", "-c:v libaom-av1 -crf 25 -b:v 0 -cpu-used 4 -pix_fmt yuv420p" COL,
@@ -397,6 +512,13 @@ namespace videoout
 			if (!cfg.renderVideoArgs.empty())
 				logger::write("info",
 					"video: RenderVideoArgs and RenderVideoExt are NOT in use - the preset supplies both. Blank RenderVideoPreset to use them.");
+		}
+
+		s_renderFolder = folder ? folder : "";
+		s_outExt        = ext;
+		{
+			const char* project = game::projectName();
+			s_projectStem = safeFileStem(project && *project ? project : "Wow Render");
 		}
 
 		snprintf(s_outPath, sizeof(s_outPath), "%s\\video.%s", folder, ext.c_str());
@@ -705,9 +827,15 @@ namespace videoout
 			if (!why.empty())
 				logger::write("info", "video: ffmpeg %s: %s",
 					(code != 0 || killed) ? "said" : "noted", why.c_str());
+
+			if (complete && !killed && code == 0)
+				publishFinishedVideo();
 		}
 
 		s_started = false;
 		s_pushed  = 0;
+		s_renderFolder.clear();
+		s_projectStem.clear();
+		s_outExt.clear();
 	}
 }

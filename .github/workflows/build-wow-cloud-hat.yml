@@ -1,4 +1,4 @@
-name: Build WOW Editor V5 Full Renderer
+name: Build WOW Editor V5.5 Project Output
 
 on:
   workflow_dispatch:
@@ -171,6 +171,6 @@ jobs:
       - name: Upload V5.3 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WOW-Editor-V5.3-FiveM-Renderer
+          name: WOW-Editor-V5.5-Project-Named-Output
           path: artifact
           compression-level: 6

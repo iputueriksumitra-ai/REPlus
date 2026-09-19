@@ -2211,13 +2211,30 @@ namespace render
 				const int   mode = game::replayMode();
 				const char* busy = game::replayBusyReason();
 
-				// The editor closed under us - nothing left to render into.
+				// FiveM can report DISABLED briefly while Export switches from
+				// the menu into full-project playback. The old code treated that
+				// transition frame as "the editor closed" and cancelled a valid
+				// export before the renderer ever started. Give the transition a
+				// short wall-clock grace period; a genuinely closed editor still
+				// cancels, only a few seconds later.
 				if (mode == gsig::REPLAYMODE_DISABLED)
 				{
+					if (now - s_pendStart < 5000)
+					{
+						if (now - s_pendLog >= 1000)
+						{
+							s_pendLog = now;
+							logger::write("info",
+								"export: waiting through FiveM editor transition "
+								"(replay mode DISABLED)");
+						}
+						return;
+					}
+
 					exporthook::clearPending();
 					s_pendWait = 0; s_pendStart = 0;
 					logger::write("info",
-						"export: not rendering - the editor closed while waiting to start");
+						"export: not rendering - the editor remained closed for 5 seconds");
 					return;
 				}
 
