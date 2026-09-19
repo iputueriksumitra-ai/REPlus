@@ -9,6 +9,7 @@ on:
 jobs:
   build:
     runs-on: windows-2022
+
     steps:
       - name: Checkout WOW Editor
         uses: actions/checkout@v4
@@ -24,6 +25,7 @@ jobs:
       - name: Get pinned RE+ capture bridge source
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force _deps | Out-Null
           git clone --filter=blob:none https://github.com/crxhvrd/simplecamera.git _deps/simplecamera
           git -C _deps/simplecamera checkout 13c92ef2565403ffcc2501f779ca7cd935e5d598
 
@@ -51,12 +53,12 @@ jobs:
       - name: Collect complete V5 package
         shell: pwsh
         run: |
-          $root       = "artifact"
-          $plugins    = Join-Path $root "FiveM.app/plugins"
-          $repBase    = Join-Path $plugins "RockstarEditorPlus"
-          $gtaRoot    = Join-Path $root "GTA_V_GAME_ROOT"
-          $shaderDir  = Join-Path $gtaRoot "reshade-shaders/Shaders"
-          $defaults   = Join-Path $root "OPTIONAL_DEFAULT_CONFIG"
+          $root      = "artifact"
+          $plugins   = Join-Path $root "FiveM.app/plugins"
+          $repBase   = Join-Path $plugins "RockstarEditorPlus"
+          $gtaRoot   = Join-Path $root "GTA_V_GAME_ROOT"
+          $shaderDir = Join-Path $gtaRoot "reshade-shaders/Shaders"
+          $defaults  = Join-Path $root "OPTIONAL_DEFAULT_CONFIG"
 
           New-Item -ItemType Directory -Force $plugins,$repBase,$gtaRoot,$shaderDir,$defaults | Out-Null
 
@@ -64,59 +66,62 @@ jobs:
 
           $ffmpeg = Get-ChildItem "_deps/ffmpeg" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
           Copy-Item $ffmpeg.FullName (Join-Path $repBase "ffmpeg.exe")
+
           if (Test-Path "build/BIN/Release/RE+ Render Settings.exe") {
             Copy-Item "build/BIN/Release/RE+ Render Settings.exe" $repBase
           }
 
-          if (Test-Path "build/BIN/Release/RockstarEditorPlus.ini") { Copy-Item "build/BIN/Release/RockstarEditorPlus.ini" $defaults }
-          if (Test-Path "build/BIN/Release/Render.ini")             { Copy-Item "build/BIN/Release/Render.ini" $defaults }
-          if (Test-Path "build/BIN/Release/Lights.ini")             { Copy-Item "build/BIN/Release/Lights.ini" $defaults }
+          if (Test-Path "build/BIN/Release/RockstarEditorPlus.ini") {
+            Copy-Item "build/BIN/Release/RockstarEditorPlus.ini" $defaults
+          }
+          if (Test-Path "build/BIN/Release/Render.ini") {
+            Copy-Item "build/BIN/Release/Render.ini" $defaults
+          }
+          if (Test-Path "build/BIN/Release/Lights.ini") {
+            Copy-Item "build/BIN/Release/Lights.ini" $defaults
+          }
 
           $addon = Get-ChildItem "_deps/simplecamera" -Recurse -Filter "IgcsConnector.addon64" | Select-Object -First 1
           Copy-Item $addon.FullName (Join-Path $gtaRoot "IgcsConnector.addon64")
           Copy-Item "_deps/simplecamera/external/IgcsConnector-main/src/Shader/IgcsDof.fx" (Join-Path $shaderDir "IgcsDof.fx")
 
-          @'
-WOW EDITOR V5 - FULL CUSTOM RENDERER
-====================================
+          $install = @(
+            "WOW EDITOR V5 - FULL CUSTOM RENDERER",
+            "====================================",
+            "",
+            "V5 keeps the proven V4/V3 systems and adds the renderer dependencies missing from the previous minimal artifact.",
+            "",
+            "FIVEM INSTALL",
+            "-------------",
+            "1. Close FiveM.",
+            "2. Copy the CONTENTS of FiveM.app\plugins\ into:",
+            "   %LOCALAPPDATA%\FiveM\FiveM.app\plugins\",
+            "   Replace RockstarEditorPlus.asi.",
+            "",
+            "3. Copy the CONTENTS of GTA_V_GAME_ROOT\ into the real GTA V folder containing GTA5.exe and ReShade.",
+            "",
+            "4. ReShade is NOT bundled. It must be installed WITH FULL ADD-ON SUPPORT.",
+            "",
+            "5. Existing V4 users should keep their current INIs/settings. Fresh defaults are in OPTIONAL_DEFAULT_CONFIG only for recovery/clean install.",
+            "",
+            "ONE VERIFICATION",
+            "----------------",
+            "Wow Editor     On",
+            "Output         Video (.mov)",
+            "Encoder Preset prores_hq",
+            "Frame Rate     60 fps",
+            "",
+            "A working custom renderer produces MOV / Apple ProRes 422 HQ.",
+            "If the result is MP4 / H.264, Rockstar's exporter still ran.",
+            "",
+            "Typical output:",
+            "%LOCALAPPDATA%\FiveM\FiveM.app\plugins\RockstarEditorPlus\Captures\"
+          )
+          $install | Set-Content -Path (Join-Path $root "INSTALL_V5.txt") -Encoding UTF8
 
-V5 keeps the proven V4/V3 systems and adds the renderer dependencies missing
-from the previous minimal artifact.
-
-FIVEM INSTALL
--------------
-1. Close FiveM.
-2. Copy the CONTENTS of:
-     FiveM.app\plugins\
-   into:
-     %LOCALAPPDATA%\FiveM\FiveM.app\plugins\
-   Replace RockstarEditorPlus.asi.
-
-3. Copy the CONTENTS of:
-     GTA_V_GAME_ROOT\
-   into the real GTA V folder containing GTA5.exe and ReShade.
-
-4. ReShade is NOT bundled. It must be installed WITH FULL ADD-ON SUPPORT.
-
-5. Existing V4 users should keep their current INIs/settings. Fresh defaults are
-   in OPTIONAL_DEFAULT_CONFIG only for recovery/clean install.
-
-ONE VERIFICATION
-----------------
-In Wow Editor Export choose:
-  Wow Editor     On
-  Output         Video (.mov)
-  Encoder Preset prores_hq
-  Frame Rate     60 fps
-
-A working custom renderer produces MOV / Apple ProRes 422 HQ.
-If the result is MP4 / H.264, Rockstar's exporter still ran.
-
-Typical output:
-  %LOCALAPPDATA%\FiveM\FiveM.app\plugins\RockstarEditorPlus\Captures\
-'@ | Set-Content -Path (Join-Path $root "INSTALL_V5.txt") -Encoding UTF8
-
-          if (Test-Path "WOW_CLOUD_HAT_NOTES.md") { Copy-Item "WOW_CLOUD_HAT_NOTES.md" $root }
+          if (Test-Path "WOW_CLOUD_HAT_NOTES.md") {
+            Copy-Item "WOW_CLOUD_HAT_NOTES.md" $root
+          }
 
       - name: Verify V5 package contents
         shell: pwsh
