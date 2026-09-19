@@ -27,6 +27,10 @@ static void InstallResolved()
 	render::applyConfig();
 	render::installHooks();
 	smoothblend::install();
+	// WOW TEAM SCENE V2: prefer FiveM's scripting-gta native bridge. It is
+	// available independently of ScriptHookV's networkInited scheduling gate,
+	// which is important while Rockstar Editor owns the session.
+	cloudhat::bindCfx();
 	menu::install();
 	limits::install();
 	// Before scene::install() for no reason other than ordering with limits -
@@ -437,15 +441,11 @@ static void ScriptThreadMain()
 
 	InstallOnce("ScriptHookV");
 
-	// WOW TEAM SCENE: Cloud Hats are a runtime layer that the replay does not
-	// reliably serialize. Keep a tiny game-fiber heartbeat solely to observe
-	// editor entry/exit and config changes. cloudhat::tick() is state/edge driven
-	// and DOES NOT re-load the hat every frame.
+	// V2: Cloud Hat no longer depends on this ScriptHookV fiber. RE+'s own
+	// editor/Scaleform heartbeat drives it instead, so park this script exactly
+	// like stock RE+ once installation is complete.
 	for (;;)
-	{
-		cloudhat::tick();
-		pScriptWait(0);
-	}
+		pScriptWait(0xFFFFFFFF);
 }
 
 // The FiveM start path.

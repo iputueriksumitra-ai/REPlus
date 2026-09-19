@@ -7,20 +7,22 @@
 
 namespace cloudhat
 {
-    // Resolve ScriptHookV's native-call exports. Safe to call repeatedly.
-    // The bridge is intentionally dynamic so the stock RE+ build remains
-    // self-contained and does not acquire a new import-library dependency.
+    // FiveM V2 preferred path. Resolve scripting-gta.dll's exported
+    // fx::ScriptEngine::CallNativeHandler and invoke the game native directly.
+    // This deliberately avoids FiveM ScriptHookV's networkInited gate, which is
+    // not reliable while Rockstar Editor owns the session.
+    bool bindCfx();
+
+    // Fallback path for ordinary ScriptHookV / non-FiveM hosts. Safe to call
+    // repeatedly; FiveM will still prefer the Cfx bridge when available.
     bool bindScriptHook(HMODULE shv);
 
-    // True once the native bridge is available. Under FiveM this becomes true
-    // when its ScriptHookV compatibility DLL is ready and the RE+ script fiber
-    // is registered.
+    // True once either native bridge is available.
     bool ready();
 
-    // Called from RE+'s ScriptHookV fiber. The function itself runs every frame,
-    // but native calls are EDGE/STATE driven: it only loads/unloads a hat when
-    // entering/leaving the editor or when the selected hat changes, and only
-    // writes alpha when the requested opacity changes.
+    // State-driven heartbeat, called from RE+'s own Scaleform/editor update
+    // path. Native calls happen only on enter/leave, selection changes, and
+    // opacity changes. A short preload->load state is used for new hats.
     void tick();
 
     int typeCount();

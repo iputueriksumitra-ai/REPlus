@@ -1,4 +1,4 @@
-﻿// This file is part of RockstarEditorPlus.
+// This file is part of RockstarEditorPlus.
 // Copyright (C) 2026 CoreFX (crxhvrd@proton.me)
 // SPDX-License-Identifier: GPL-3.0-only
 // RockstarEditorPlus is free software: you can redistribute it and/or modify it
@@ -327,6 +327,12 @@ namespace scene
 	// common case is one compare.
 	void tick()
 	{
+		// WOW TEAM SCENE V2: run Cloud Hat from RE+'s own Scaleform/editor
+		// heartbeat, not from ScriptHookV's scheduled script fiber. This path
+		// continues to run while Rockstar Editor owns playback. cloudhat::tick()
+		// is state driven; it does not LOAD_CLOUD_HAT every frame.
+		cloudhat::tick();
+
 		const Config& cfg = Config::get();
 		const bool want = overridesActive()
 		               && (cfg.overrideTimeOfDay || cfg.overrideWeather)
