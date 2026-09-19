@@ -1,0 +1,537 @@
+// This file is part of RockstarEditorPlus.
+// Copyright (C) 2026 CoreFX (crxhvrd@proton.me)
+// SPDX-License-Identifier: GPL-3.0-only
+// RockstarEditorPlus is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License v3 as published by the Free
+// Software Foundation. See the LICENSE file for details.
+
+#include "main.h"
+#include "utils/paths.h"
+
+#include <string>
+#include "capture/fxcapture.h"
+
+#include <cstdio>
+#include <cstring>
+#include <atomic>
+#include <psapi.h>
+#include <shlwapi.h>
+#include <vector>
+#pragma comment(lib, "version.lib")
+#pragma comment(lib, "shlwapi.lib")
+
+namespace fxcapture
+{
+	namespace
+	{
+		// Same name and magic as Simple Camera - deliberately. One addon, one
+		// channel, whichever ASI is rendering drives it. They are never
+		// rendering at the same time: one runs in free roam, one in the editor.
+		const char* kMappingName = "Local\\SimpleCameraFxCapture";
+		constexpr uint32_t kMagic   = 0x53434658; // 'SCFX'
+		// 7 added the autofocus fields. Nothing reads this to gate behaviour -
+		// the fields are appended, so an older add-on simply never looks at them
+		// and the capture protocol is unchanged. It is here to be seen in a log
+		// when a pair does turn out to be mismatched.
+		constexpr uint32_t kVersion = 15;
+
+		// Last dofCopyRequest we acted on. See init() for why it is seeded.
+		uint32_t s_copySeen = 0;
+
+		// One place, always, next to the exe. Every render is a numbered
+		// subfolder inside it.
+		// Renders go in the mod's own folder now, one numbered subfolder each -
+		// see utils/paths.h for the layout. The game root is left alone.
+
+		HANDLE          s_map   = nullptr;
+		FxCaptureBlock* s_block = nullptr;
+
+		// CreateDirectory only makes the leaf, so a configured path several
+		// levels deep would fail on the first missing parent. Walk it.
+		void createTree(const char* path)
+		{
+			char buf[MAX_PATH];
+			strncpy_s(buf, sizeof(buf), path, _TRUNCATE);
+			for (char* p = buf; *p; ++p)
+			{
+				if (*p != '\\' && *p != '/') continue;
+				// Skip "C:\" and the leading slashes of a UNC path - those are
+				// not directories anyone can create.
+				if (p == buf || *(p - 1) == ':' || *(p - 1) == '\\') continue;
+				const char save = *p;
+				*p = '\0';
+				CreateDirectoryA(buf, nullptr);
+				*p = save;
+			}
+			CreateDirectoryA(buf, nullptr);
+		}
+
+		// The folder GTA5.exe lives in - NOT the folder this ASI lives in. They
+		// are usually the same, but some loaders run plugins from a subfolder,
+		// and renders turning up somewhere different depending on how the user
+		// installed the mod is exactly the confusion this folder is meant to end.
+		void gameDir(char* out, size_t cap)
+		{
+			GetModuleFileNameA(GetModuleHandleA(nullptr), out, (DWORD)cap);
+			if (char* slash = strrchr(out, '\\')) *slash = '\0';
+		}
+
+		// =====================================================================
+		//  Which ReShade is loaded, if any
+		// =====================================================================
+		//  "Export fell back to the vanilla encoder" has one overwhelmingly
+		//  common cause: the ORDINARY ReShade build, which cannot load add-ons
+		//  at all. The add-on is then never loaded, never presents, the
+		//  heartbeat stays zero and Export correctly declines to divert - and
+		//  nothing anywhere says why. It is in both READMEs and it still cost a
+		//  support round, because people install first and read later.
+		//
+		//  It is decidable, and by exactly the test ReShade's own add-on header
+		//  uses to find its host: walk the loaded modules for one exporting
+		//  ReShadeRegisterAddon / ReShadeUnregisterAddon. Those live inside
+		//  `#if RESHADE_ADDON`, so the standard build does not have them.
+		//
+		//  When that fails we still want to distinguish "no ReShade" from "the
+		//  wrong ReShade", so a second pass looks for a module whose version
+		//  resource names ReShade. Present without the exports IS the wrong
+		//  build, and that is the sentence worth printing.
+		// =====================================================================
+		bool moduleNamesReShade(HMODULE m)
+		{
+			char path[MAX_PATH]{};
+			if (!GetModuleFileNameA(m, path, MAX_PATH)) return false;
+
+			DWORD handle = 0;
+			const DWORD size = GetFileVersionInfoSizeA(path, &handle);
+			if (!size) return false;
+
+			std::vector<char> buf(size);
+			if (!GetFileVersionInfoA(path, handle, size, buf.data())) return false;
+
+			// Language-agnostic: walk whatever translation the file actually has
+			// rather than assuming 040904b0.
+			struct LangCp { WORD lang, cp; }* tr = nullptr;
+			UINT trLen = 0;
+			if (!VerQueryValueA(buf.data(), "\\VarFileInfo\\Translation",
+			                    (void**)&tr, &trLen) || trLen < sizeof(LangCp))
+				return false;
+
+			for (UINT i = 0; i < trLen / sizeof(LangCp); ++i)
+			{
+				for (const char* field : { "ProductName", "FileDescription" })
+				{
+					char q[128]{};
+					sprintf_s(q, "\\StringFileInfo\\%04x%04x\\%s",
+						tr[i].lang, tr[i].cp, field);
+					char* val = nullptr; UINT vlen = 0;
+					if (VerQueryValueA(buf.data(), q, (void**)&val, &vlen) && val)
+						if (StrStrIA(val, "ReShade")) return true;
+				}
+			}
+			return false;
+		}
+
+		// Walks the loaded modules for the add-on host. `outPath` is optional and
+		// receives the module's file name when one is found.
+		//
+		// Factored out of reportReShade so the menu can ask the same question the
+		// log answers, rather than the two drifting into different opinions about
+		// what is installed.
+		HostState scanHost(char* outPath, size_t cap)
+		{
+			if (outPath && cap) outPath[0] = '\0';
+
+			HMODULE mods[1024]{};
+			DWORD   need = 0;
+			if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need))
+				return HOST_NONE;
+
+			const DWORD count = (need > sizeof(mods) ? sizeof(mods) : need) / sizeof(HMODULE);
+
+			HMODULE addonCapable = nullptr, looksLikeReShade = nullptr;
+			for (DWORD i = 0; i < count; ++i)
+			{
+				if (GetProcAddress(mods[i], "ReShadeRegisterAddon") &&
+				    GetProcAddress(mods[i], "ReShadeUnregisterAddon"))
+				{
+					addonCapable = mods[i];
+					break;
+				}
+				if (!looksLikeReShade && moduleNamesReShade(mods[i]))
+					looksLikeReShade = mods[i];
+			}
+
+			HMODULE found = addonCapable ? addonCapable : looksLikeReShade;
+			if (outPath && cap && found) GetModuleFileNameA(found, outPath, (DWORD)cap);
+
+			return addonCapable ? HOST_ADDONS
+			     : looksLikeReShade ? HOST_NO_ADDONS
+			                        : HOST_NONE;
+		}
+
+		void reportHost(HostState s, const char* path)
+		{
+			switch (s)
+			{
+			case HOST_ADDONS:
+				logger::write("info", "capture: ReShade WITH add-on support -> %s", path);
+				break;
+
+			case HOST_NO_ADDONS:
+				logger::write("info",
+					"capture: !! ReShade is loaded (%s) but it is the ORDINARY build - it "
+					"cannot load add-ons at all, so IgcsConnector will never run and Export "
+					"will always fall back to the game's own encoder. Reinstall ReShade and "
+					"choose the version WITH full add-on support.", path);
+				break;
+
+			default:
+				// "not yet" rather than "not at all" - see hostState(). This line
+				// at startup means nothing on its own; what matters is whether a
+				// later one supersedes it.
+				logger::write("info",
+					"capture: no ReShade in this process YET. This is checked again while "
+					"the editor is open, and a later line supersedes this one - so if none "
+					"follows, ReShade really is absent or is not a build we can see. "
+					"Rendering and depth of field need ReShade WITH full add-on support; "
+					"everything else works without it.");
+				break;
+			}
+		}
+
+	}
+
+	void init()
+	{
+		if (s_block) return;
+
+		SetLastError(0);
+		s_map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+		                           0, sizeof(FxCaptureBlock), kMappingName);
+		if (!s_map)
+		{
+			logger::write("info", "capture: could not create the shared channel");
+			return;
+		}
+		const bool existed = (GetLastError() == ERROR_ALREADY_EXISTS);
+
+		s_block = (FxCaptureBlock*)MapViewOfFile(s_map, FILE_MAP_ALL_ACCESS, 0, 0,
+		                                         sizeof(FxCaptureBlock));
+		if (!s_block)
+		{
+			CloseHandle(s_map);
+			s_map = nullptr;
+			return;
+		}
+
+		// Only zero it if we are the one who created it. Simple Camera or the
+		// addon may already own this block and be mid-render.
+		if (!existed) memset(s_block, 0, sizeof(FxCaptureBlock));
+
+		// Name ourselves, so the add-on can bind to OUR exports.
+		//
+		// More than one mod exports the IGCS camera-tools interface - NVE does -
+		// and the add-on takes the first loaded module that has it. Load order
+		// then silently decides whose camera a depth-of-field session drives.
+		{
+			HMODULE self = nullptr;
+			GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                   (LPCSTR)&createTree, &self);
+			const uint64_t h = (uint64_t)self;
+			s_block->asiModuleLo = (uint32_t)(h & 0xFFFFFFFFull);
+			s_block->asiModuleHi = (uint32_t)(h >> 32);
+		}
+
+		// Seed the copy counter to whatever is already there.
+		//
+		// The block outlives us - it is named shared memory, and the add-on may
+		// have been running before this ASI attached. Starting the edge detector
+		// at zero would read a leftover count as a fresh button press and stamp a
+		// stale focus onto whatever marker happened to be selected.
+		s_copySeen = s_block->dofCopyRequest;
+
+		s_block->magic   = kMagic;
+		s_block->version = kVersion;
+		if (s_block->quality == 0) s_block->quality = 90;
+
+		logger::write("info", "capture: channel mapped (%s), addon=%s",
+			existed ? "joined" : "created",
+			s_block->addonHeartbeat ? "present" : "not seen yet");
+
+		// Which ReShade, if any. The answer decides whether rendering can work at
+		// all - but it is NOT reliably knowable this early, so this only seeds
+		// the first report and hostState() corrects it later if the module list
+		// grows. See the note there.
+		hostState();
+	}
+
+	bool available()    { return s_block != nullptr; }
+
+	// Read through volatile.
+	//
+	// These three are written by ANOTHER PROCESS - the capture addon - and are
+	// polled here in a loop that does nothing else. Read as plain fields, the
+	// compiler is entitled to hoist them out of the caller's polling loop and
+	// spin forever on a stale copy; nothing in the source tells it the value can
+	// change under it. The block is shared memory, so it never can be cached
+	// that way safely.
+	namespace
+	{
+		inline uint32_t vread(const uint32_t& field)
+		{
+			return *(const volatile uint32_t*)&field;
+		}
+	}
+
+	bool addonPresent() { return s_block && vread(s_block->addonHeartbeat) != 0; }
+
+	// -------------------------------------------------------------------------
+	// Which ReShade is loaded - re-checked until it settles, and logged whenever
+	// the answer CHANGES.
+	//
+	// The startup report used to be the only one, and it was frequently wrong:
+	// "no ReShade in this process" written by an ASI that had installed before
+	// ReShade's DLL was in the module list. The user then has a log confidently
+	// contradicting a ReShade they can see running, and nothing ever corrects it.
+	//
+	// A single answer is the wrong shape for this question. Module lists grow,
+	// and the honest report is a TRANSITION: say what is true now, say it again
+	// if it stops being true. So this logs on change, and the startup line says
+	// "YET" and that a later line supersedes it.
+	//
+	// Only HOST_ADDONS settles - that cannot become untrue, ReShade does not
+	// unload. Everything else keeps re-scanning, which is what lets the
+	// correction happen at all.
+	// -------------------------------------------------------------------------
+	HostState hostState()
+	{
+		static HostState s_cached   = HOST_NONE;
+		static int       s_reported = -1;     // nothing said yet
+		static bool      s_settled  = false;
+
+		if (s_settled) return s_cached;
+
+		char path[MAX_PATH]{};
+		s_cached = scanHost(path, sizeof(path));
+		if (s_cached == HOST_ADDONS) s_settled = true;
+
+		if ((int)s_cached != s_reported)
+		{
+			s_reported = (int)s_cached;
+			reportHost(s_cached, path);
+		}
+		return s_cached;
+	}
+	bool lastDone()     { return !s_block || vread(s_block->ackId) == vread(s_block->requestId); }
+
+	uint32_t heartbeat() { return s_block ? vread(s_block->addonHeartbeat) : 0; }
+
+	bool requestSample(const char* fullPath, int sampleCount, int sampleIndex)
+	{
+		if (!s_block || !fullPath) return false;
+
+		strncpy_s(s_block->outPath, sizeof(s_block->outPath), fullPath, _TRUNCATE);
+		s_block->sampleCount = sampleCount < 1 ? 1u : (uint32_t)sampleCount;
+		s_block->sampleIndex = (uint32_t)sampleIndex;
+		s_block->status      = 0;
+
+		// The ordering below is the entire handshake, so it needs a barrier
+		// rather than a comment.
+		//
+		// x86 will not reorder the stores at run time, but the COMPILER will:
+		// none of these fields is volatile and the increment does not depend on
+		// the path copy, so at /O2 it is free to sink the copy past the bump.
+		// The addon would then act on a request whose outPath is still the
+		// previous frame's - which writes one frame twice and loses another,
+		// and only under optimisation, on some builds, some of the time.
+		std::atomic_thread_fence(std::memory_order_release);
+
+		// Bumped LAST, so every field is in place before the addon can see the
+		// request. Same ordering rule as Simple Camera's writer.
+		*(volatile uint32_t*)&s_block->requestId = s_block->requestId + 1;
+		return true;
+	}
+
+	void setQuality(int q)
+	{
+		if (!s_block) return;
+		if (q < 1) q = 1;
+		if (q > 100) q = 100;
+		s_block->quality = (uint32_t)q;
+	}
+
+	void setHighlightBoost(float b)
+	{
+		if (!s_block) return;
+		if (b < 0.0f) b = 0.0f;
+		if (b > 0.99f) b = 0.99f;
+		s_block->highlightBoost = b;
+	}
+
+	bool autofocusWanted(float* pointX, float* pointY)
+	{
+		if (!s_block || s_block->afEnabled == 0) return false;
+
+		// Clamped rather than trusted. This crosses a process boundary from a
+		// UI that can be edited while we read it, and it goes on to pick a
+		// direction to fire a world query in.
+		float x = s_block->afPointX;
+		float y = s_block->afPointY;
+		if (!(x >= 0.0f && x <= 1.0f)) x = 0.5f;
+		if (!(y >= 0.0f && y <= 1.0f)) y = 0.5f;
+
+		if (pointX) *pointX = x;
+		if (pointY) *pointY = y;
+		return true;
+	}
+
+	void autofocusAnswer(float distance, float tanHalfHFov, uint32_t status)
+	{
+		if (!s_block) return;
+
+		s_block->afDistance    = distance;
+		s_block->afTanHalfHFov = tanHalfHFov;
+		s_block->afStatus      = status;
+
+		// Last, and after the values it describes: the add-on reads this to
+		// decide the rest is fresh, so bumping it first would hand over the
+		// previous frame's numbers under a new id.
+		++s_block->afResultId;
+	}
+
+	float capturedAspect()
+	{
+		if (!s_block || s_block->width == 0 || s_block->height == 0) return 0.0f;
+		return (float)s_block->width / (float)s_block->height;
+	}
+
+	uint32_t dofRequest(float shutterMs, float bokehSize, int quality,
+	                    bool autofocus, float focusX, float focusY,
+	                    float focusDelta, bool externalTime)
+	{
+		if (!s_block) return 0;
+
+		s_block->dofShutterMs = shutterMs;
+
+		// Written BEFORE the counter, always. The add-on reads them when it sees
+		// a new id, so publishing the id first would hand it the previous
+		// frame's lens for one pass - and one wrong frame in a 26-frame render
+		// is exactly the kind of thing that gets blamed on the game.
+		s_block->dofBokehSize = bokehSize;
+		s_block->dofQuality   = (uint32_t)quality;
+		s_block->dofAutofocus = autofocus ? 1u : 0u;
+		s_block->dofFocusX    = focusX;
+		s_block->dofFocusDelta = focusDelta;
+		s_block->dofExternalTime = externalTime ? 1u : 0u;
+		// Cleared with the request, so a stale count from the previous pass cannot
+		// be mistaken for this one's before the add-on has answered.
+		s_block->dofSampleTotal  = 0u;
+		s_block->dofSampleIndex  = 0u;
+		s_block->dofFocusY    = focusY;
+
+		// Never 0 - that value is reserved for "no pass wanted", and is how a
+		// render says it is over. A counter that wrapped onto it would read as a
+		// teardown in the middle of a sequence.
+		uint32_t next = s_block->dofSeq + 1;
+		if (next == 0) next = 1;
+		s_block->dofSeq = next;
+		return next;
+	}
+
+	bool dofDone(uint32_t seq)
+	{
+		return s_block && seq != 0 && s_block->dofDoneSeq == seq;
+	}
+
+	uint32_t dofSampleTotal()
+	{
+		return s_block ? s_block->dofSampleTotal : 0u;
+	}
+
+	uint32_t dofSampleIndex()
+	{
+		return s_block ? s_block->dofSampleIndex : 0u;
+	}
+
+	bool copyFocusRequested()
+	{
+		if (!s_block) return false;
+
+		const uint32_t now = s_block->dofCopyRequest;
+		if (now == s_copySeen) return false;
+		s_copySeen = now;
+		return true;
+	}
+
+	bool liveFocus(float* delta, float* bokeh)
+	{
+		if (!s_block) return false;
+		const float b = s_block->dofLiveBokeh;
+		// A zero aperture is the add-on never having published, not a lens set to
+		// nothing - and it is also the divisor the caller is about to use.
+		if (!(b > 1e-6f)) return false;
+		if (delta) *delta = s_block->dofLiveFocusDelta;
+		if (bokeh) *bokeh = b;
+		return true;
+	}
+
+	uint32_t dofStatus()
+	{
+		return s_block ? s_block->dofStatus : 0;
+	}
+
+	void dofEnd()
+	{
+		if (!s_block) return;
+		s_block->dofSeq = 0;
+	}
+
+	bool newSequenceFolder(const char* baseIn, char* outFolder, int cap)
+	{
+		if (!s_block) return false;
+
+		char base[MAX_PATH];
+		if (baseIn && *baseIn)
+		{
+			strncpy_s(base, sizeof(base), baseIn, _TRUNCATE);
+			// A trailing separator would give us "dir\\render_0001".
+			for (size_t n = strlen(base); n && (base[n - 1] == '\\' || base[n - 1] == '/'); --n)
+				base[n - 1] = '\0';
+			createTree(base);
+		}
+		else
+		{
+			// sub() hands back a trailing separator; drop it so the
+			// numbered subfolder below does not end up double-slashed.
+			std::string caps = paths::sub("Captures");
+			if (!caps.empty() && caps.back() == '\\') caps.pop_back();
+			strncpy_s(base, sizeof(base), caps.c_str(), _TRUNCATE);
+		}
+
+		for (int n = 1; n < 10000; ++n)
+		{
+			char folder[MAX_PATH];
+			sprintf_s(folder, "%s\\render_%04d", base, n);
+			if (GetFileAttributesA(folder) != INVALID_FILE_ATTRIBUTES) continue;
+			if (!CreateDirectoryA(folder, nullptr)) continue;
+			if (outFolder && cap > 0) strncpy_s(outFolder, cap, folder, _TRUNCATE);
+			return true;
+		}
+		return false;
+	}
+
+	// Same resolution as above, without creating anything - see the header.
+	std::string captureBaseDir(const char* base)
+	{
+		if (base && *base)
+		{
+			std::string b = base;
+			while (!b.empty() && (b.back() == '\\' || b.back() == '/')) b.pop_back();
+			return b;
+		}
+		std::string caps = paths::sub("Captures");
+		if (!caps.empty() && caps.back() == '\\') caps.pop_back();
+		return caps;
+	}
+}

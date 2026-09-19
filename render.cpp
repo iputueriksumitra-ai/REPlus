@@ -1,0 +1,3834 @@
+// This file is part of RockstarEditorPlus.
+// Copyright (C) 2026 CoreFX (crxhvrd@proton.me)
+// SPDX-License-Identifier: GPL-3.0-only
+// RockstarEditorPlus is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License v3 as published by the Free
+// Software Foundation. See the LICENSE file for details.
+
+#include "main.h"
+#include "capture/render.h"
+#include "capture/fxcapture.h"
+#include "game/worldprobe.h"
+#include "capture/exporthook.h"
+#include "capture/videoout.h"
+#include "capture/audioout.h"
+#include "capture/dofsession.h"
+#include "game/signatures.h"
+
+#include <cstdio>
+
+namespace render
+{
+	namespace
+	{
+		enum class Step
+		{
+			Idle,
+			Settle,   // waiting for the game to render at the time we jumped to
+			Ack,      // waiting for the addon to acknowledge our capture request
+			Audio,    // playing at normal speed, recording sound, no frames
+			Slide,    // the clip is PLAYING; accumulate whatever is presented
+			DofPass,  // waiting on the add-on to accumulate one frame across the
+			          // aperture. Tens of seconds, not milliseconds - see kDofGuardMs
+			DofGap,   // one present spent with the shutter closed, so the part of
+			          // the frame the aperture did not cover reaches the world as
+			          // real time rather than as a bare accumulator write
+			ClipJump, // waiting for a clip step we asked the engine for
+			Rewind,   // audio done, going back to clip 1 to start the frames
+			Done,
+		};
+
+		Settings s_cfg;
+
+		// A settings change arrived while a render was running and was withheld
+		// from s_cfg. Replayed by finish(), so the next render gets it.
+		bool s_cfgDirty = false;
+
+		Step  s_step   = Step::Idle;
+		int   s_frame  = 0;      // output frame index
+		int   s_frames = 0;      // total output frames
+		int   s_sample = 0;      // sub-sample within the current output frame
+
+		// The depth-of-field pass in flight, if any.
+		uint32_t s_dofSeq     = 0;
+		// The add-on's aperture-sample index as of last present. The clock is
+		// stepped on CHANGES to it, never per present.
+		uint32_t s_dofLastSample = 0;
+		bool     s_dofToldIndex  = false;
+		int      s_dofToldSpan   = 0;
+		float    s_dofClockAtStart = 0.0f;
+
+		// The clock as the closed-shutter present was armed, so the present that
+		// follows can say what it actually moved. Measured rather than assumed
+		// because "the step was set" and "the engine took it" are different
+		// claims, and only the second one reaches the world.
+		float    s_dofClockAtGap   = 0.0f;
+		float    s_dofGapMs        = 0.0f;   // closed-shutter time still to spend
+		int      s_dofGapWait      = 0;      // presents spent trying to spend it
+		int      s_dofPresents     = 0;      // presents in this output frame
+
+		// A stuck clock must not wedge the render. Generous: the point of the
+		// loop is that it takes as many presents as the engine needs, and only a
+		// clock that has stopped entirely should ever reach this.
+		constexpr int kDofGapGuard = 240;
+
+		// HOW MANY PRESENTS THE CLOSED SHUTTER IS SPREAD OVER.
+		//
+		// Not one, and this is the whole reason the first attempt at this changed
+		// nothing. CPtFxGPUManager::PreRender is queued with DLC_Add and RUNS ON
+		// THE RENDER THREAD, where it reads ptFxGPUManager.m_deltaTime live at
+		// execution time - the draw-list command carries only the paused/reset
+		// bools, not the delta. The value is not double-buffered either, though
+		// m_groundPosZ and m_camPosZ right beside it are, so what the render
+		// thread integrates is simply whatever the update thread last wrote.
+		//
+		// Deliver the gap as ONE step and it is a single odd value among ~686
+		// identical tiny ones, and the render thread almost never samples it -
+		// the time reaches the replay clock and never reaches the rain. Spread
+		// over several presents that all carry the SAME step, any lag between the
+		// two threads reads the right number, because its neighbours are equal.
+		//
+		// Eight is far more than the pipeline is deep and costs ~1% of a sweep.
+		//
+		// A TARGET, not a count. Spending exactly N presents and trusting them was
+		// the first attempt and it drifted - frame 1 asked for 27.08ms and moved
+		// 33.85, because presents outside the count take the step too. So the loop
+		// below runs on the CLOCK instead, which is what the non-lens sliding path
+		// does with s_slideTime, and that path is the one whose rain is correct.
+		constexpr int kDofGapPresents = 8;
+		uint32_t s_dofStartMs = 0;
+		int      s_dofRetries = 0;
+
+		// A refused pass is retried rather than fatal.
+		//
+		// Aborting on the first one threw away twenty-five minutes of finished
+		// frames because a single session start came back busy. The reasons a
+		// start can be refused are all transient - something else holding the
+		// clock for a frame, a seek still settling - so the right response is to
+		// ask again, and only give up if it keeps saying no.
+		constexpr int kDofMaxRetries = 5;
+
+		// A pass sweeps the whole aperture at the configured sample count, so it
+		// is a minutes-scale operation, not a frame-scale one. Timed in wall
+		// clock rather than counted in presents for the same reason the audio
+		// stall is: at 100 fps a present count that means "a while" during setup
+		// means "instantly" here.
+		constexpr uint32_t kDofGuardMs = 15u * 60u * 1000u;
+
+		// The live replay clock, for the depth-of-field trace below.
+		float clockNow()
+		{
+			return game::addr_g_ReplayTimeMs ? *(float*)game::addr_g_ReplayTimeMs : -1.0f;
+		}
+
+		// The shutter handed to a pass, in milliseconds of clip time.
+		//
+		// RenderShutter is a FRACTION of the output frame interval, which is the
+		// form the walking renderer wants; the add-on wants a duration. Converted
+		// here so there is exactly one shutter in the system and it is the one on
+		// the render settings - the panel's own value is not consulted in this
+		// mode, and two of them fighting would show up as blur that does not
+		// match the number anyone set.
+		// Focus for the frame about to be rendered, per marker.
+		//
+		// Resolved by the spline update, which already has the marker window and
+		// the clock. Falls back to the render's own configured values when no clip
+		// has been played yet, so a render started cold behaves as it always did.
+		bool dofAutofocusNow()
+		{
+			bool af = s_cfg.dofAutofocus;
+			smoothblend::focusNow(nullptr, &af);
+			return af;
+		}
+		float dofFocusDeltaNow()
+		{
+			float d = Config::get().renderDofFocusDelta;
+			smoothblend::focusNow(&d, nullptr);
+			return d;
+		}
+
+		float dofShutterMs()
+		{
+			if (s_cfg.fps <= 0.0f) return 0.0f;
+			return (1000.0f / s_cfg.fps) * s_cfg.shutter;
+		}
+		int   s_wait   = 0;      // settle frames remaining
+		int   s_guard  = 0;      // frames spent waiting for one ack
+
+		float s_start = 0.0f;    // clip time of frame 0, ms
+		float s_dt    = 0.0f;    // output frame interval, ms
+
+		bool  s_openEnded = false;  // stop when the clock stops following us
+		int   s_shortRuns = 0;      // consecutive seeks that fell short
+		float s_lastClock  = -1.0f; // clock at the previous check, to spot a clip restart
+
+		// --- sliding renderer ------------------------------------------------
+		//
+		// Clip time accumulated so far, summed from the replay clock rather than
+		// taken from it. The clock RESTARTS at every clip, so it is a position
+		// inside the clip on screen and not a position in the project - summing
+		// the per-present deltas and refusing the negative ones is what turns it
+		// into a project-long timeline that output frames can be cut from.
+		double s_slideTime   = 0.0;
+		int    s_slideSample = 0;    // samples accumulated into the current frame
+		bool   s_slideFlush  = false;// a flush was posted; collect it next present
+		bool   s_fxStep      = false;// the engine is stepping this render, not us
+		float  s_fxSampleMs  = 0.0f; // clip ms one sub-sample advances
+		float  s_fxGapMs     = 0.0f; // ...and the closed-shutter remainder
+
+		// Live playback speed, steered to hit RenderSamples.
+		//
+		// Sample count in a sliding render is P/(F*S) - present rate over output
+		// rate times speed - and P is not knowable in advance: it depends on the
+		// scene, the resolution and how expensive the capture turns out to be. So
+		// asking the user for a SPEED means asking them to predict their own frame
+		// rate, which is no way to request "16 samples".
+		//
+		// So it is DERIVED, never configured: measured once from the first
+		// frame's advance phase, then held against drift by the controller in
+		// the flush below. There is deliberately no ini key - the only value a
+		// person could supply is a worse one than the measurement.
+		float s_slideSpeed   = 0.05f;
+		bool  s_slideCapture = false;// false = advancing to the mark, true = exposing
+		double s_slideMark   = 0.0;  // clip time at which this frame's exposure opened
+		int   s_slideLogged  = 0;    // last speed reported, to keep the log quiet
+		double s_slideStep   = 0.0;  // clip ms one present covers, smoothed
+		bool  s_slideCalib   = false;// AUTO has taken its measurement
+		int   s_slideWarm    = 0;    // presents spent measuring before frame 0
+		uint32_t s_slideWarmT0 = 0;  // real time the kept half of that started
+		int   s_slideWarmN0  = 0;    // present count when that window opened
+		double s_slidePerPresent = 0.0; // REAL ms per present, measured
+		bool  s_slideStepOk  = true; // did the clip play at the speed we asked?
+		bool  s_slideToldRemeasure = false;
+		bool  s_slideToldReach = false; // reported an unreachable shutter, once
+
+		// REAL milliseconds between presents, smoothed. Not clip time.
+		//
+		// s_slideStep answers "how much clip time did that present cover", which
+		// is only meaningful once you know the speed that was actually in force -
+		// and during warm-up you do not. playbackSetSpeed does not take effect on
+		// the present that issues it, so the early deltas are still at whatever
+		// the clip was running at before, and dividing them by the speed we MEANT
+		// to set reports nonsense: a measurement at 1.0x divided by an intended
+		// 0.005x said one present covered 1387ms of clip.
+		//
+		// The feasibility question - can N presents span this shutter at 1.0x -
+		// is really a question about wall-clock, because at 1.0x clip time and
+		// real time advance together. So ask wall-clock directly and the speed
+		// stops mattering.
+		double        s_slideRealStep = 0.0;
+		long long     s_slideLastQpc  = 0;
+
+		// sampleCount handed to the addon for a sample that is NOT the last one.
+		// It only has to exceed the index, since the addon averages and writes on
+		// `sampleIndex >= sampleCount - 1` and merely accumulates otherwise - so
+		// this is "do not flush yet" rather than a real count. The true divisor
+		// is sent with the final sample, once it is known.
+		constexpr uint32_t kSlideOpen = 1u << 24;
+
+		// Where AUTO begins before it has measured anything. Any value the
+		// clip visibly advances at will do - it survives exactly one frame's
+		// advance phase.
+		// Deliberately far too SLOW rather than a best guess.
+		//
+		// The first frame is exposed before anything has been measured, and the
+		// two failure directions are not symmetric: too slow costs a couple of
+		// under-blurred frames at the head, too fast bakes a smear. At 0.1x the
+		// first frame came out spanning 1373ms of a 33ms shutter - over a second
+		// of the clip crushed into one image.
+		constexpr float kSlideSeed = 0.005f;
+
+		// Presents to spend measuring before the first frame is exposed.
+		//
+		// Frame 0 has no advance phase to measure during - its mark is zero, so
+		// the capture starts on the very first present - which is exactly how the
+		// seed reached the shutter unchallenged. These are pre-roll: the clip
+		// moves a fraction of a millisecond at the seed speed and the output
+		// timeline is rebased afterwards, so nothing is lost from the head.
+		constexpr int kSlideWarm = 12;
+
+		// Warm-up presents are CHEAP - nothing is being captured - while exposure
+		// presents carry a full read-back and accumulate, and ran 2-6x slower in
+		// practice. So a speed derived from warm-up alone comes out too high.
+		// Bias it down and let the controller climb: the climb costs a few soft
+		// frames, the alternative costs a smeared one.
+		constexpr float kSlideCalibBias = 0.35f;
+
+		// FLOOR: the least clip time one present may cover.
+		//
+		// The replay clock does not resolve arbitrarily small steps. Two runs on
+		// the same clip, differing only in sample count:
+		//     16 samples -> 0.0235x -> 0.73ms of clip per present -> fine
+		//     64 samples -> 0.0125x -> 0.40ms per present -> clock never moves
+		// So the threshold is between the two, and 0.40 was first set AT the
+		// failing value from a mis-derived figure. 0.90 sits clear of the last
+		// known-bad and under the last known-good with margin.
+		//
+		// So this is a hard limit of the engine, not of the pacing, and no
+		// calibration can work around it: below the floor the clock simply has
+		// no smaller step to take. What CAN be chosen is which way to fail -
+		// a shutter slightly longer than asked for, or a render that hangs.
+		// A longer shutter is more blur; a hang is no video at all.
+		constexpr double kMinClipStepMs = 0.90;
+
+		// --- position steering -------------------------------------------------
+		// How much of the measured drift is taken out per cycle. The controller
+		// gets exactly one correction per output frame, and the measurement is
+		// quantised by the present that carried it, so a full-gain response
+		// chases quantisation noise and rings. Half settles in about two frames.
+		constexpr double kSlideDriftGain = 0.5;
+
+		// Bounds on the corrected target span, as a fraction of the wanted one.
+		// Deliberately lopsided - see the note at the controller. Behind is free,
+		// ahead is not, so slowing down is allowed almost without limit and
+		// catching up is rationed.
+		constexpr double kSlideTargetLo = 0.05;
+		constexpr double kSlideTargetHi = 1.75;
+
+		// --- ONE SAMPLE ---------------------------------------------------------
+		// How much clip time a single present may cover, as a fraction of the
+		// output frame interval, when there is no exposure to spread.
+		//
+		// At one sample there is no span to regulate - the frame is an instant -
+		// so the only thing left to hold is WHERE that instant lands on the grid.
+		// The advance phase waits for an absolute mark, so the error per frame is
+		// bounded by whatever one present advances and never compounds; this is
+		// what bounds it. A quarter of a frame keeps the landing within 25% of its
+		// slot while letting the clip run as fast as that allows.
+		//
+		// This used to be 0.1 AND the controller was skipped entirely at one
+		// sample, which is what made no-blur sliding pathologically slow: ten
+		// presents per output frame, and the deliberate 0.35x calibration bias -
+		// which exists ONLY because "the controller will climb it back" - was
+		// never climbed back by a controller that never ran. Measured at ~0.17x,
+		// i.e. a ten-second clip taking over three minutes.
+		constexpr double kSlideStep1 = 0.25;
+
+		// How much of the one-sample step correction to apply per frame.
+		//
+		// Damped, because the thing being measured is both LAGGING and BIMODAL.
+		// s_slideStep is an exponential average, so it is still reporting the
+		// previous speed for a frame or two after a change; and the presents it
+		// averages are not alike - the one that captures carries a full read-back
+		// and runs several times slower than the ones that merely advance. Full
+		// gain against that produced a clean limit cycle: speed hunting
+		// 0.18x..1.0x every six frames, the measurement chasing it one step
+		// behind, and the render taking longer than a steady speed would.
+		//
+		// Same reasoning as kSlideDriftGain, which damps the multi-sample loop
+		// for the same class of reason.
+		constexpr double kSlideStepGain = 0.35;
+
+		// Ceiling on the automatic sample raise above.
+		//
+		// The figure is derived from a live measurement, so a pathological one -
+		// a present rate collapsing during warm-up, a stalled clock - must not be
+		// able to turn "2 samples" into a four-figure render. 64 is the shipped
+		// default and already expensive; anything past it is a measurement fault
+		// rather than a real requirement.
+		constexpr int kSlideMaxAutoSamples = 64;
+
+		// Project time is OURS; the game seeks in the current clip's own time.
+		// s_clipBase is where the live clip starts in its timeline, s_clipProjAt
+		// is the project time that lands there, and everything between them is
+		// the same distance in both. Re-based whenever the editor changes clip.
+		float s_clipBase   = 0.0f;
+		float s_clipProjAt = 0.0f;
+
+		// The first clip's own span, and a flag for having come back to it.
+		// A preview does not stop at the end of the last clip - it wraps to the
+		// first - so returning to this range is what 'the project ended' actually
+		// looks like from in here.
+		//
+		// Only the FALLBACK now. Two clips trimmed out of the same recording, or
+		// simply two clips that both start at zero, report the same span - and
+		// this then called the second one a wrap and ended the render one clip
+		// in. Anything that can see the clip table uses s_clipAt below instead,
+		// where "clip 3 became clip 1" is a fact rather than an inference.
+		float s_firstLo = -1.0f;
+		float s_firstHi = -1.0f;
+		bool  s_looped  = false;
+
+		// Where we are in the project's clip list, and the step we have asked
+		// the engine for. s_clipN is 0 when the clip table could not be read, and
+		// every clip-aware path below is written to fall back when it is.
+		int   s_clipAt     = 0;
+		int   s_clipN      = 0;
+		int   s_wantClip   = -1;    // clip index requested, -1 = nothing pending
+		float s_wantClipAt = 0.0f;  // time inside it our project clock lands on
+		int   s_clipWait   = 0;     // frames spent waiting for one clip step
+		int   s_declineWait = 0;    // CONSECUTIVE frames the clip table declined
+
+		int   s_pendWait  = 0;      // frames spent waiting for a diverted export
+		unsigned long s_pendStart = 0; // tick when that wait began; 0 = not waiting
+		unsigned long s_pendLog   = 0; // tick of the last "still waiting" line
+		int   s_startMode = -1;     // replay mode the render began in
+		int   s_busyWait  = 0;      // frames spent waiting out a clip load
+		int   s_modeWait  = 0;      // frames spent in a transient replay mode
+
+		// The real-time audio pass. Survives between renders on purpose: it is
+		// what tells the NEXT Export press that a wav is waiting for it.
+		bool        s_audioPass  = false;
+		// When the clip clock was first seen standing still, or 0 while it is
+		// moving. A TICK rather than a present count, because the same count means
+		// 1.5s at 60fps and 0.45s at 200fps - and the fast end truncates takes.
+		// Shared by the audio pass (gate + end) and by sliding's end test, which
+		// all ask the same question.
+		uint32_t    s_clockStillTick = 0;
+		int         s_autoOpen   = 0;   // ticks until the frame pass is started for us
+
+		// A frame is being captured - by a render OR by a depth-of-field session.
+		//
+		// The two are different features and it does not matter: both accumulate
+		// what is on screen into an output image, so both need the UI gone. The
+		// spinner hooks used to test only for a render, which meant a DoF session
+		// - which seeks constantly, and so raises the ring constantly - composited
+		// it into every sample. The movie hook below already got this right; the
+		// spinners did not, and this is the shared answer.
+		bool capturingFrame()
+		{
+			return (s_step != Step::Idle) || dofsession::active();
+		}
+
+		std::string s_pendingWav;
+
+		// Last value seen by the undiverted-bake watcher in pump(). File scope
+		// rather than a local static so finish() can account for the ONE
+		// transition into bake that we cause ourselves - see the write there.
+		// -2 means "not seeded yet"; the watcher never judges its first read.
+		int         s_lastType   = -2;
+
+		// True when this render came from the Export button rather than the
+		// menu. Only an export should close playback afterwards - doing it to a
+		// menu-started render would eject you from the clip you were editing.
+		bool  s_fromExport = false;
+
+		// Set by the spinner hook when the game tried to draw a loading spinner.
+		// Sampled and cleared by the pump, so it means "the last presented frame
+		// was not a clean one".
+		volatile bool s_spinnerSeen = false;
+
+		// How many times the spinner hook actually fired during a render. If a
+		// spinner is visible in the output but this stays 0, the function we
+		// hooked is not the one drawing it - the game has more than one spinner
+		// system (CPauseMenu::RenderAnimatedSpinner vs CBusySpinner::Render).
+		volatile unsigned s_spinnerHits = 0;
+
+		using FnSpinner = void(__fastcall*)(float, int, int);
+		FnSpinner origSpinner = nullptr;
+
+		using FnPointer = void(__fastcall*)();
+		FnPointer origPointer = nullptr;
+
+		// The OS cursor is a SECOND cursor, and g_CursorVisible has no say over it.
+		//
+		// Two things put it back mid-render: closing the ReShade overlay, which
+		// hands the cursor back the way it found it, and alt-tabbing away and
+		// returning, where the focus change re-shows it. Both were baked into
+		// frames while the game-side flag was still correctly false.
+		int s_cursorPushed = 0;   // decrements we owe back when the render ends
+
+		void osCursorHide()
+		{
+			// ShowCursor is a COUNTER, not a switch - the cursor draws while the
+			// count is >= 0, so a single call loses to anything that pushed it up.
+			// Only push when it is actually showing: pushing unconditionally would
+			// walk a step further negative every frame with no way to give it back.
+			CURSORINFO ci{ sizeof(ci) };
+			if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING)) return;
+			for (int guard = 0; guard < 64 && ShowCursor(FALSE) >= 0; ++guard)
+				++s_cursorPushed;
+			++s_cursorPushed;   // the call that finally took it under zero
+		}
+
+		void osCursorRestore()
+		{
+			while (s_cursorPushed > 0) { ShowCursor(TRUE); --s_cursorPushed; }
+		}
+
+		// Forcing the flag from the pump was not enough: the input code rewrites
+		// it every frame, and our write landed before this function consumed it.
+		// Setting it HERE, at the point of use, is the only ordering that holds -
+		// the same reasoning as suppressing the spinner in its own draw call.
+		void __fastcall hkPointer()
+		{
+			const bool hide = capturingFrame() && Config::get().renderHideHud;
+			if (hide) game::setCursorVisible(false);
+			// Restores itself the moment the render ends - no extra call site to
+			// forget, and it runs on the window's own thread either way.
+			if (hide) osCursorHide(); else osCursorRestore();
+
+			// The frame pass is started from HERE, not from the render pump.
+			//
+			// pump() is driven by the replay camera's update, which stops the
+			// moment playback closes - and the audio pass ends with the game
+			// closing playback and returning to the export menu. So the countdown
+			// sat there never ticking and the second pass never began. This
+			// function runs every frame in the frontend, which is exactly where
+			// we are by then.
+			//
+			// Opening playback from a frontend update is what the Export button
+			// itself does - TriggerExport runs out of the menu's input handling -
+			// so this is the same context the game uses, not a new one.
+			if (s_step == Step::Idle && s_autoOpen > 0 && --s_autoOpen == 0)
+			{
+				if (!s_pendingWav.empty())
+				{
+					logger::write("info", "render: audio captured - starting the frame pass");
+					game::openPlayback(gsig::PLAYBACK_TYPE_BAKE);
+				}
+			}
+			origPointer();
+
+			// Clear it AFTER Update as well.
+			//
+			// Update does not merely consume the flag, it writes it - so clearing
+			// only on the way in left the GAME as the last writer for the rest of
+			// the frame. Any frame where something asked for the cursor back was
+			// then drawn with it, which is one visible frame per event and enough
+			// to ghost into an accumulated exposure.
+			if (hide) game::setCursorVisible(false);
+		}
+
+		void __fastcall hkSpinner(float a, int b, int cc)
+		{
+			if (capturingFrame())
+			{
+				// Suppress AND remember. Suppressing alone would leave a frame
+				// that the game itself considered unready; remembering alone
+				// would still composite the spinner into it.
+				s_spinnerSeen = true;
+				++s_spinnerHits;
+				return;
+			}
+			origSpinner(a, b, cc);
+		}
+
+		// -------------------------------------------------------------------------
+		// The spinner neither hook above catches - the SEEK spinner.
+		//
+		// It shows as a bare segmented ring dead centre with NO body text, and it
+		// was baked into output frames 0-3 of an Enhanced render. Both hooks below
+		// were installed and the pump's hold-on-spinner path never fired, so it
+		// goes through neither.
+		//
+		// What it actually is: the editor raises a busy spinner for ANY seek -
+		// scrubbing the timeline by hand does it too. A render seeks constantly,
+		// and the big one is the jump to the start, so it lands on the first
+		// frames and clears once the small per-frame steps take over.
+		//
+		// It is stopped at its SOURCE instead - see hkSpinnerOn below. Blocking
+		// the Scaleform call that carries it was tried and removed: it did land,
+		// and the ring was still drawn, because by then the spinner had been
+		// handed to a movie that animates it on its own with no further native
+		// calls.
+		// -------------------------------------------------------------------------
+
+		// The game's SECOND spinner. CPauseMenu::RenderAnimatedSpinner above and
+		// CBusySpinner::Render are unrelated systems with their own movies, and
+		// suppressing only the first still left one composited into Enhanced
+		// renders. Runs on the RENDER thread, so this stays trivial.
+		using FnBusySpinner = void(__fastcall*)();
+		FnBusySpinner origBusySpinner = nullptr;
+
+		void __fastcall hkBusySpinner()
+		{
+			if (capturingFrame())
+			{
+				s_spinnerSeen = true;
+				++s_spinnerHits;
+				return;
+			}
+			origBusySpinner();
+		}
+
+		// -------------------------------------------------------------------------
+		// Where the spinner is actually RAISED.
+		//
+		// CBusySpinner::On(bodyText, icon, sourceIndex). The editor calls this for
+		// every seek, which is why scrubbing the timeline flashes a ring in the
+		// middle of the screen at all, and why a render - which seeks for a living
+		// - gets one baked into its frames.
+		//
+		// Dropping the call for the VIDEO EDITOR source alone is the whole fix.
+		// Nothing downstream then has a spinner to show: no list entry is written,
+		// no movie is told to display one, and the matching Off() for that source
+		// becomes a harmless no-op. Every other source - savegame, script, cloud,
+		// profanity - is untouched.
+		//
+		// Gated on a render, which it did not used to be - it suppressed the editor
+		// spinner everywhere, on the reasoning that a spinner appearing only
+		// sometimes is worse than one that never appears. That was wrong about who
+		// it affects. The ring during a seek is stock behaviour people have used for
+		// years and read as "the editor is working"; taking it away outside a render
+		// buys nothing and makes a normal editor look broken. A rendered FRAME must
+		// carry no UI - that is the whole requirement, and it stops at the render.
+		// -------------------------------------------------------------------------
+		using FnSpinnerOn = void(__fastcall*)(const char*, int, int);
+		FnSpinnerOn origSpinnerOn = nullptr;
+
+		void __fastcall hkSpinnerOn(const char* bodyText, int icon, int sourceIndex)
+		{
+			if (sourceIndex == gsig::SPINNER_SOURCE_VIDEO_EDITOR &&
+			    capturingFrame())
+			{
+				// Suppressing alone would leave a frame the game itself considered
+				// unready, so mark it too.
+				s_spinnerSeen = true;
+				++s_spinnerHits;
+				return;
+			}
+			origSpinnerOn(bodyText, icon, sourceIndex);
+		}
+
+		// -------------------------------------------------------------------------
+		// The spinner's REAL draw - the one that finally works on Enhanced.
+		//
+		// hkSpinner above hooks CPauseMenu::RenderAnimatedSpinner, which is only a
+		// wrapper. That is sufficient on Legacy, where MSVC kept the call. Clang
+		// inlined it into most of its eleven callers on Enhanced - including the
+		// editor's Render, which reaches the draw four separate times - so the
+		// editor's spinner never passed through the wrapper and the detour on it
+		// never fired. Hooking the callee cannot be bypassed: every route,
+		// wrapper included, ends here.
+		//
+		// Suppressed during a capture only - a rendered frame carries no UI. Outside
+		// one the ring is drawn exactly as stock, which is what people expect to see
+		// while a seek is working.
+		// -------------------------------------------------------------------------
+		using FnDrawSpinner = void(__fastcall*)(void*, void*, int, int, int);
+		FnDrawSpinner origDrawSpinner = nullptr;
+
+		void __fastcall hkDrawSpinner(void* pos, void* size, int a, int b, int c)
+		{
+			if (capturingFrame())
+			{
+				// Mid-capture: suppress and mark the frame unclean, exactly as the
+				// other spinner hooks do.
+				s_spinnerSeen = true;
+				++s_spinnerHits;
+				return;
+			}
+
+			origDrawSpinner(pos, size, a, b, c);
+		}
+
+		// -------------------------------------------------------------------------
+		// Every Scaleform movie's draw.
+		//
+		// Last layer standing. The ring in the centre of the screen survived, in
+		// order: RenderAnimatedSpinner suppressed, CBusySpinner::Render suppressed,
+		// SET_SAVING_TEXT refused (confirmed landing on movies 1 and 17),
+		// CBusySpinner::On dropped at source, and the editor HUD and cursor flags
+		// forced down. An always-on log of BeginMethod then showed ZERO Scaleform
+		// method calls for an entire render with the ring visible - so whatever
+		// draws it was configured before the render began and animates itself.
+		//
+		// A movie like that can only be stopped where it DRAWS. Skipping every
+		// movie for the duration of a capture is also just correct: a rendered
+		// frame should carry no UI whatsoever, and this is the one place that
+		// guarantees it regardless of which movie or which system put it there.
+		//
+		// Gated on renderHideHud so it stays opt-out, and on s_step so normal
+		// editor use is untouched. Reached from BOTH the main and the render
+		// thread - the same function does the param update and the draw, picked
+		// by a per-thread flag - so keep it trivial.
+		// -------------------------------------------------------------------------
+		using FnDrawMovie = void(__fastcall*)(unsigned int, void*, void*, void*, void*,
+		                                      unsigned int, unsigned int, char, char);
+		FnDrawMovie origDrawMovie = nullptr;
+
+		void __fastcall hkDrawMovie(unsigned int movieId, void* pos, void* scale,
+		                            void* depth, void* colour,
+		                            unsigned int a, unsigned int b, char c, char d)
+		{
+			// A captured frame should carry no UI, whichever movie or system put
+			// it there. This is the one place that guarantees it.
+			//
+			// Covers a depth-of-field session as well as a render. That blend
+			// runs during ReShade's effect pass, i.e. after the game has drawn
+			// its own frame - so without this the timeline and transport bar are
+			// accumulated into every sample.
+			if (capturingFrame() && Config::get().renderHideHud) return;
+
+			origDrawMovie(movieId, pos, scale, depth, colour, a, b, c, d);
+		}
+
+		uint32_t s_lastBeat = 0;
+
+		// Progress reporting. A 64-sample render is minutes per second of
+		// footage, and until now it logged "export started" and then nothing at
+		// all until it finished - so a slow render and a hung one looked
+		// identical, and there was no way to judge whether to wait. The output
+		// file is no help either: mp4 writes its index at the end, so it sits at
+		// 48 bytes throughout regardless of progress.
+		uint32_t s_startTick   = 0;
+		uint32_t s_lastReport  = 0;
+		constexpr uint32_t kReportEveryMs = 15000;
+		char     s_folder[MAX_PATH]{};
+	}
+
+	namespace
+	{
+
+		// An ack that never arrives means the addon died mid-render. Bail rather
+		// than freezing the editor forever.
+		constexpr int kAckGuard = 600;
+
+		// A clip load is slow but finite. Well past the worst case, so this
+		// only fires if something is genuinely wedged.
+		constexpr int kBusyGuard = 5000;
+
+		// Loading the next clip of a project is a real disk load, not a seek.
+		// Generous on purpose: the failure this protects against (a mode that
+		// never returns) is rare, while giving up too early throws away the
+		// whole render.
+		constexpr int kModeGuard = 5000;
+
+		// DISABLED is also how a genuine exit looks, so it waits seconds, not a
+		// minute - long enough to ride out a transition that passes through it.
+		constexpr int kExitGuard = 240;
+
+		// How long the clip clock may sit still before the audio pass calls it the
+		// end of the project. Long enough not to trip on a hitch, short enough not
+		// to record silence onto the tail.
+		//
+		// MILLISECONDS, not presents. As a present count the same constant meant
+		// 1.5s at 60fps, 9s at 10fps and 0.45s at 200fps - and at the fast end a
+		// brief stall reads as the end of the project, truncating the wav that the
+		// frame pass then takes its length from.
+		constexpr int kAudioStallMs = 1500;
+
+		// Clamp a slide speed to something the replay clock can step. Shared by
+		// the calibration and the per-frame controller so they cannot disagree.
+		// Sliding with the lens on: the world keeps simulating across the exposure
+		// instead of being frozen at one instant.
+		//
+		// Needs the engine's stepper - without it we have no way to advance the
+		// clock BETWEEN aperture samples, and the pass degenerates to Walking's
+		// frozen instant. That is a silent difference, so it is logged at start.
+		bool slidingDof()
+		{
+			return s_cfg.dof && s_cfg.captureMode == 1 && s_fxStep;
+		}
+
+		// ONE progress line, whichever mode is running.
+		//
+		// Sliding used to print frames + clip time with no percentage or estimate,
+		// while walking printed percentage + time left. Same event, two shapes, so
+		// two renders could not be compared at a glance and neither could be
+		// grepped for reliably.
+		//
+		// Rate-limited here rather than at each call site, so the interval cannot
+		// drift apart between modes either.
+		void reportProgress(bool force = false)
+		{
+			const uint32_t now = GetTickCount();
+			if (!force && now - s_lastReport < kReportEveryMs) return;
+			s_lastReport = now;
+
+			const float elapsed  = (now - s_startTick) / 1000.0f;
+			const bool  haveRate = s_frame > 0;
+			const float perFrame = haveRate ? elapsed / (float)s_frame : 0.0f;
+
+			if (!haveRate)
+			{
+				logger::write("info",
+					"render: 0/%d frames, %.0fs elapsed - still on the first",
+					s_frames, elapsed);
+			}
+			else if (s_openEnded)
+			{
+				// No total to divide by, so no percentage and no estimate - but the
+				// same words in the same order as the line below it.
+				logger::write("info",
+					"render: %d frames, %.0fs elapsed, %.1fs/frame",
+					s_frame, elapsed, perFrame);
+			}
+			else
+			{
+				logger::write("info",
+					"render: %d/%d frames (%.0f%%), %.0fs elapsed, %.1fs/frame, "
+					"~%.0fs left",
+					s_frame, s_frames, 100.0f * s_frame / (float)s_frames, elapsed,
+					perFrame, perFrame * (float)(s_frames - s_frame));
+			}
+		}
+
+		void slideFloor(float& sp)
+		{
+			float lo = 0.001f;
+			if (s_slidePerPresent > 0.0)
+			{
+				const float f = (float)(kMinClipStepMs / s_slidePerPresent);
+				if (f > lo) lo = f;
+			}
+			if (sp < lo)   sp = lo;
+			if (sp > 1.0f) sp = 1.0f;
+		}
+
+
+		// Time of the current sub-sample. Samples are spread across the OPEN
+		// part of the frame interval only, which is what shutter angle means:
+		// shutter 0.5 exposes the first half of the interval, so the blur trail
+		// covers half a frame of motion and the rest is dark time.
+		// Real output time of the current sub-sample, BEFORE dilation is undone.
+		// The render's own clock advances here, uniformly, one frame interval at a
+		// time - that is what makes the output file play at a constant rate.
+		float sampleTimeDilated()
+		{
+			const float base = s_start + (float)s_frame * s_dt;
+
+			// One sample means no blur at all, and the shutter is not consulted -
+			// which is what makes "render high fps, blend in post" a clean path
+			// through this code rather than a special case.
+			if (s_cfg.samples <= 1) return base;
+
+			// Samples sit at the CENTRE of each slice, not its leading edge.
+			// Using k/N would put the first sample exactly on the frame time and
+			// the last one a slice short of the shutter close, biasing every
+			// blurred frame backwards by half a slice. (k+0.5)/N is the midpoint
+			// rule and has no such bias.
+			const float open = s_dt * s_cfg.shutter;
+			return base + open * (((float)s_sample + 0.5f) / (float)s_cfg.samples);
+		}
+
+		// The same instant expressed on the AUTHORED timeline - which is what the
+		// rest of this file, and JumpTo, work in.
+		//
+		// Marker speed (5..200%) is the only thing that makes these differ. The
+		// render clock above is uniform, so undoing the dilation here is what
+		// stretches a 50% section across twice as many output frames, i.e. actual
+		// slow motion in the file rather than the section simply playing at full
+		// speed and being over too soon.
+		//
+		// The AUDIO pass needs nothing equivalent: it plays the project through in
+		// real time and records what comes out, so the wav has always carried the
+		// dilation. It was the frame pass that did not - which means this fix
+		// removes an A/V desync on speed-marker projects rather than creating one.
+		//
+		// With no speed markers anywhere, ConvertTimeToNonDilatedTimeMs is the
+		// identity and this returns exactly what sampleTimeDilated() did before.
+		// -------------------------------------------------------------------------
+		// The clock to seek to for the current frame and sub-sample.
+		//
+		// CReplayMgr::JumpTo takes an ABSOLUTE time inside the clip on screen,
+		// not a position in the project, and a clip trimmed out of the middle of
+		// a recording starts nowhere near zero. Clip one usually begins at ~0,
+		// which is why passing project time straight through worked for exactly
+		// as long as a render stayed in the first clip: on clip two the request
+		// fell below the clip's start, the engine clamped it there, and every
+		// seek for the rest of the render landed on the same first frame - a
+		// picture frozen while the frame counter climbed.
+		// -------------------------------------------------------------------------
+		float seekTime()
+		{
+			// The clip remap happens in DILATED (real) time, because that is what
+			// it is for: output frames step uniformly in real time, and this
+			// keeps them doing so across a clip boundary.
+			const float clock = s_clipBase + (sampleTimeDilated() - s_clipProjAt);
+
+			if (!Config::get().renderMarkerSpeed) return clock;
+
+			// The marker's speed is applied LAST, and per clip, on an offset
+			// measured from that clip's own start. Applying it before the remap -
+			// which is what this did - fed the conversion a raw replay clock and
+			// asked for a position thousands of milliseconds into a one-second
+			// clip. See clipRealOffsetToClockMs.
+			return game::clipRealOffsetToClockMs(clock - s_clipBase);
+		}
+
+		// Seek to the next output frame and go back to settling.
+		//
+		// Split out of Step::Ack because there are two ways in now: a frame
+		// whose shutter closed before the frame ended spends a present in
+		// Step::DofGap first, everything else arrives straight from Ack.
+		void seekAndSettle()
+		{
+			s_dofPresents = 0;
+			game::jumpProjectTo(seekTime(), 0);
+
+			// Trace the clock through the whole depth-of-field cycle.
+			//
+			// Three readings a frame, always on in this mode. The playhead was
+			// pinned to one instant for a whole render while the frame counter,
+			// the files and the progress line all looked correct, and reasoning
+			// about WHERE it was being reset produced three wrong answers in a
+			// row. These say it outright: what was asked for, what the clock read
+			// immediately after, and what it read when the next pass opened.
+			if (s_sample == 0)
+			{
+				// Both halves of the time, because seekTime() is built from
+				// sampleTime(), and sampleTime() runs sampleTimeDilated() through
+				// the marker-speed conversion. If the raw one advances and the
+				// converted one does not, the conversion is the fault - and it is
+				// the only step between them.
+				if (Config::get().splineDebugLog)
+					logger::write("info",
+						"seq: frame %d seek -> raw %.1f, asked %.1f, clock %.1f (markerSpeed=%d)",
+						s_frame, sampleTimeDilated(), seekTime(), clockNow(),
+						Config::get().renderMarkerSpeed ? 1 : 0);
+			}
+
+			// Advancing to a new output frame is a real seek - a whole frame
+			// interval. Stepping between sub-samples moves the clock by
+			// dt*shutter/N, a fraction of a millisecond. Waiting the same for
+			// both is what made a render cost minutes per second of footage:
+			// at 64 samples that is 192 frames of waiting per output frame, and
+			// 189 of them are for seeks far too small to need it.
+			//
+			// It cannot go to zero. One redraw per sub-sample is precisely what
+			// produces the blur - skip it and all 64 samples capture the same
+			// image, which averages back to one sharp frame.
+			s_wait = (s_sample == 0) ? s_cfg.settleFrames : s_cfg.settleSubFrames;
+			s_step = Step::Settle;
+		}
+
+		// Point the mapping at whatever clip the editor is showing now, keeping
+		// the project position we are at. Called at the start of a render and
+		// after every clip transition.
+		void rebaseClip(const char* why)
+		{
+			float lo = 0.0f, hi = 0.0f;
+			if (!game::clipRange(lo, hi)) return;   // Legacy: identity mapping
+
+			if (s_firstLo < 0.0f) { s_firstLo = lo; s_firstHi = hi; }
+			else if (lo == s_firstLo && hi == s_firstHi) s_looped = true;
+
+			s_clipBase   = lo;
+			s_clipProjAt = sampleTimeDilated();
+			s_lastClock  = -1.0f;
+			logger::write("info", "render: clip %s - project %.0f now maps to clip time %.0f..%.0f",
+				why, s_clipProjAt, lo, hi);
+		}
+
+		// Put the playhead back at the very start of the project.
+		//
+		// False means it cannot be done from here - no clip table, or playback
+		// is already gone - and the caller should fall back to re-opening.
+		bool rewindToProjectStart()
+		{
+			float lo = 0.0f, hi = 0.0f;
+			if (!game::clipRangeAt(0, lo, hi)) return false;
+
+			// Pause first in both cases. The audio pass leaves playback ROLLING,
+			// and a preview that keeps rolling while the engine gets around to
+			// our request can wrap to clip one on its own - which lands us at the
+			// right clip by the wrong route, with playback still running.
+			game::playbackPause();
+
+			// Already on clip one: there is no clip to step to, and asking for
+			// the one we are on is a no-op the engine drops, so seek instead.
+			if (game::clipIndex() == 0)
+			{
+				game::jumpProjectTo(lo, 0);
+				return true;
+			}
+			return game::jumpToClip(0, lo);
+		}
+
+
+		void buildPath(char* out, int cap)
+		{
+			snprintf(out, cap, "%s\\frame_%06d.%s", s_folder, s_frame,
+				s_cfg.jpeg ? "jpg" : "png");
+		}
+
+		// Drop an ffmpeg cheat-sheet next to the frames.
+		//
+		// The intended workflow is to render with no in-engine blur at a
+		// multiple of the target rate and synthesise the blur in post, which
+		// gives a shutter angle you can change afterwards without re-rendering.
+		// Getting the tmix/fps pair right is fiddly and easy to get subtly
+		// wrong, so the numbers are worked out here where the rendered rate is
+		// actually known.
+		void writeAssembleHelp()
+		{
+			char path[MAX_PATH];
+			snprintf(path, sizeof(path), "%s\\assemble.txt", s_folder);
+
+			FILE* f = nullptr;
+			if (fopen_s(&f, path, "w") != 0 || !f) return;
+
+			const char* ext = s_cfg.jpeg ? "jpg" : "png";
+			const float fps = s_cfg.fps;
+
+			fprintf(f, "Rendered %d frames at %g fps (%s).\n\n", s_frame, fps, ext);
+
+			fprintf(f, "Straight conform, no added blur:\n");
+			fprintf(f, "  ffmpeg -framerate %g -i frame_%%06d.%s"
+			           " -c:v libx264 -crf 16 -pix_fmt yuv420p out.mp4\n\n", fps, ext);
+
+			if (s_cfg.samples <= 1)
+			{
+				// Blend M source frames down to one output frame. Averaging ALL
+				// of them is a 360-degree shutter; averaging half is 180. So to
+				// land on 180 you need the source rate to be twice the multiple
+				// you are blending, which is why the 180 line below wants 4x.
+				const float half    = fps * 0.5f;
+				const float quarter = fps * 0.25f;
+
+				fprintf(f, "Synthesised motion blur (this is the intended route -\n"
+				           "shutter is chosen here, not at render time):\n\n");
+
+				fprintf(f, "  %g fps, 360-degree shutter (blend every 2, halve the rate):\n", half);
+				fprintf(f, "    ffmpeg -framerate %g -i frame_%%06d.%s"
+				           " -vf \"tmix=frames=2:weights='1 1',fps=%g\""
+				           " -c:v libx264 -crf 16 -pix_fmt yuv420p out.mp4\n\n", fps, ext, half);
+
+				fprintf(f, "  %g fps, 180-degree shutter (blend 2 of every 4):\n", quarter);
+				fprintf(f, "    ffmpeg -framerate %g -i frame_%%06d.%s"
+				           " -vf \"tmix=frames=2:weights='1 1',fps=%g\""
+				           " -c:v libx264 -crf 16 -pix_fmt yuv420p out.mp4\n\n", fps, ext, quarter);
+
+				fprintf(f, "  General rule: render at target*M, then blend"
+				           " round(M * shutter) frames\n"
+				           "  and decimate to the target rate. Blending all M is 360 degrees.\n");
+			}
+			else
+			{
+				fprintf(f, "These frames already contain %d-sample motion blur at a"
+				           " %.0f-degree\nshutter, baked in at render time.\n",
+				           s_cfg.samples, s_cfg.shutter * 360.0f);
+			}
+
+			// Audio is an instruction rather than a rewritten command line: the
+			// blur variants above differ in their filters and rates, and adding
+			// the same three arguments to each would triple the file for no
+			// gain. Appended once, applies to whichever line you pick.
+			//
+			// The wav THIS render just captured wins over AudioFromFile.
+			//
+			// In Frames mode the audio pass still runs - a full real-time
+			// playthrough - but there is no encoder for it to be muxed into, so
+			// without naming it here that pass was paid for and then silently
+			// wasted: the wav sat in the folder and the only file telling you
+			// how to assemble anything pointed somewhere else.
+			const std::string& au = !s_pendingWav.empty() ? s_pendingWav
+			                                              : Config::get().audioFromFile;
+			if (!au.empty())
+			{
+				fprintf(f, "\nAudio: insert this before the output filename on"
+				           " whichever line you use.\n");
+				fprintf(f, "  -i \"%s\" -map 0:v -map 1:a -c:a aac -b:a 320k -shortest\n",
+					au.c_str());
+				fprintf(f, "\n-shortest is not optional: the frame count sets the video"
+				           " length and the\nborrowed track is however long the game's"
+				           " export ran. They agree only\napproximately.\n");
+			}
+
+			fclose(f);
+		}
+
+		void finish(const char* why, bool complete)
+		{
+			// The replay mode belongs in every one of these. Whether an accessor
+			// could answer at the moment a render stopped is the first thing
+			// worth knowing, and a report that does not carry it costs a whole
+			// round trip to ask for.
+			logger::write("info", "render: finishing at frame %d - replay mode %s",
+				s_frame, gsig::replayModeName(game::replayMode()));
+
+			// Same argument as the pass below, one layer down: the engine is
+			// holding a vtable pointer of OURS while a render steps the replay.
+			// Leaving it swapped past the render outlives what it points into.
+			game::fixedTimeEnd();
+			s_fxStep = false;
+
+			// Unconditional, and first. A pass left running would keep sweeping an
+			// aperture for a render that no longer exists, and it holds the editor
+			// camera while it does. Covers the abort, the end of the sequence and
+			// Escape alike, because all three come through here.
+			if (s_dofSeq != 0)
+			{
+				fxcapture::dofEnd();
+				s_dofSeq = 0;
+			}
+
+			// Ten call sites pass complete=true and only two of them are "reached
+			// the target frame count" - the rest are early exits that the clock,
+			// the clip walk or the project wrap decided for us. Every one of them
+			// used to read as an unqualified success, so a video that stopped at
+			// 60 frames of 87 was signed off as finished and the shortfall had to
+			// be spotted by eye in the frame numbers.
+			//
+			// Said once, here, rather than at each site: whatever the reason, a
+			// short render is worth its own line.
+			if (complete && !s_audioPass && s_frames > 0 &&
+			    s_frame < s_frames - s_frames / 20)
+			{
+				logger::write("info",
+					"render: STOPPED SHORT at %d of %d frames (%s) - the video is "
+					"complete only up to that point. Something ended playback early: "
+					"a held clock, a clip that would not step, or a frame count that "
+					"was over-estimated for this project.",
+					s_frame, s_frames, why);
+			}
+
+			s_step = Step::Idle;
+
+			// Unconditional: an aborted render must not leave the editor with a
+			// permanently invisible HUD and no obvious way to get it back.
+			if (Config::get().renderHideHud)
+			{
+				game::setEditorHudVisible(true);
+				game::setCursorVisible(true);
+			}
+			// An audio pass has no encoder and no frames. Everything below is
+			// for the frame pass.
+			if (s_audioPass)
+			{
+				const double secs = audioout::seconds();
+				audioout::end();
+				s_pendingWav = audioout::path();
+				s_audioPass  = false;
+
+				// Straight on to the frames, in this same playback.
+				//
+				// The two passes used to be two Export presses, because the
+				// second one has to start at the beginning of the project and a
+				// seek cannot get there - it clamps to the clip on screen, and
+				// the audio pass ends on the LAST clip. Re-pressing Export was
+				// the only thing that reliably rewound.
+				//
+				// A clip step can, so it does. Staying inside the playback we
+				// are already in also removes the fragile part of the old route:
+				// waiting out a close, counting frames in the frontend, and
+				// hoping the re-open lands - none of which has to happen now.
+				//
+				// An audio pass that did NOT finish leaves a partial wav, and
+				// leaving the path set hands it to the next Export - which then
+				// skips its own audio pass, adopts a truncated take, and reuses
+				// this render's folder on top of it. Drop it here so the next
+				// press starts clean.
+				if (!complete) s_pendingWav.clear();
+
+				// `complete` gates it: a CANCELLED audio pass must not go on to
+				// render frames the user just asked to stop.
+				if (complete && !s_pendingWav.empty() && rewindToProjectStart())
+				{
+					s_step     = Step::Rewind;
+					s_clipWait = 0;
+					s_modeWait = 0;
+					logger::write("info",
+						"render: %s (%.2fs of audio) - rewinding to clip 1 for the frame pass",
+						why, secs);
+					return;
+				}
+
+				// Fallback, for a playback that has already closed under us or a
+				// build where the clip table did not resolve: the old two-press
+				// route. Two seconds is long enough for the editor to finish
+				// returning to its menu, short enough not to look like nothing
+				// happened.
+				s_autoOpen = (complete && !s_pendingWav.empty()) ? 120 : 0;
+				logger::write("info", "render: %s (%.2fs of audio) - %s", why, secs,
+					s_autoOpen ? "frame pass starts in ~2s"
+					           : "nothing recorded, press Export to render silent");
+				return;
+			}
+
+			// Close the encoder before anything else that can bail out of this
+			// function: ffmpeg only finalises the container when its stdin
+			// closes, so an early return here would leave an unplayable file.
+			// Called unconditionally - end() is a no-op when no video was
+			// started, and an aborted render still deserves its partial video.
+			videoout::end(complete);
+
+			// The assemble helper is for the frames-only workflow. With a video
+			// already written and the frames consumed, it would describe files
+			// that are no longer there.
+			if (complete && s_frame > 0 && !Config::get().wantsVideo()) writeAssembleHelp();
+
+			// Hand the playback type back before anything closes playback.
+			//
+			// CVideoEditorPlayback::Close() branches on it to choose where the
+			// editor goes next. Left as PREVIEW - which is what our diversion
+			// makes it - it takes the preview branch, which shows the OPTIONS
+			// menu and rebuilds the timeline. That is why the editor came back
+			// on the wrong screen after an export, with Start Export leading
+			// into the clip editor: the game was correctly returning us to
+			// where a preview ends, having been told a preview is what ran.
+			// The bake branch goes to the export menu, which is where the user
+			// pressed the button.
+			//
+			// Done here and nowhere earlier: for the whole render the type has
+			// to stay PREVIEW, because that is precisely what keeps the game's
+			// own encoder out of the way.
+			if (s_fromExport)
+			{
+				game::setPlaybackType(gsig::PLAYBACK_TYPE_BAKE);
+
+				// Account for it, or the watcher in pump() reports our own write
+				// as the vanilla encoder starting. It tests for a transition INTO
+				// bake while no export is pending and the renderer is idle - and
+				// s_step was set to Idle at the top of this function, so all three
+				// hold. It fired on every successful export from the Export
+				// button, which is the one path where nothing is wrong at all.
+				s_lastType = gsig::PLAYBACK_TYPE_BAKE;
+			}
+
+			// Return to the editor the way a finished bake does. Deferred via the
+			// game's own flag, never a direct Close(): this runs inside the
+			// camera update, where tearing playback down is not survivable.
+			if (s_fromExport && Config::get().exportCloseWhenDone)
+			{
+				if (!game::requestPlaybackClose())
+					logger::write("info", "export: close-when-done unresolved - staying in playback");
+			}
+			// One wav per pair of presses. Leaving it set would silently attach
+			// the previous project's audio to the next render.
+			//
+			// UNCONDITIONAL, including on an abort. It used to be gated on
+			// `complete`, so every failed render - addon gone, stuck loading,
+			// clip step never landed - left the path set. The next Export then
+			// did three wrong things at once: skipped its own audio pass, muxed
+			// the stale wav, and took the folder-REUSE branch in begin(), writing
+			// its frames and video.mp4 straight over the previous render's
+			// output. The overwrite is the serious one - it is silent data loss
+			// from a render that merely failed.
+			if (!s_pendingWav.empty())
+			{
+				s_pendingWav.clear();
+				videoout::setAudio("");
+			}
+
+			s_fromExport = false;
+			s_wantClip   = -1;   // never let a half-finished step reach the next render
+			logger::write("info", "render: %s (%d/%d frames, %d clip(s), spinnerHits=%u, %s)",
+				why, s_frame, s_frames, s_clipN ? s_clipAt + 1 : 0, s_spinnerHits, s_folder);
+			s_spinnerHits = 0;
+
+			// A settings change that arrived mid-render was withheld from s_cfg;
+			// now is when it can safely land. applyConfig() re-reads Config itself,
+			// so this needs no copy of what changed - only that something did.
+			if (s_cfgDirty)
+			{
+				logger::write("info", "render: applying the settings changed during the render");
+				applyConfig();
+			}
+		}
+
+		// A requested clip step has arrived. Re-establish the render's own
+		// playback state on the far side of it and carry on.
+		//
+		// The pause matters: a clip transition runs the engine's state machine,
+		// which restores ITS saved state on the way out. Left alone, the clock
+		// still follows our seeks while the world no longer redraws for them -
+		// the frame counter climbs and the picture stays frozen.
+		void landClip()
+		{
+			// A gap present that never got spent: a transition can land from any
+			// step, and this is the one step that has the clock armed for exactly
+			// one present. Left armed it would keep stepping through the settle
+			// below. Narrowly on DofGap, because the sliding path arms the clock
+			// across a seam ON PURPOSE and zeroing it there would stall the clip.
+			if (s_step == Step::DofGap)
+			{
+				game::fixedTimeSetStep(0.0f);
+				s_dofGapMs = 0.0f;
+			}
+
+			game::playbackPause();
+
+			s_clipAt     = s_wantClip;
+			s_clipBase   = s_wantClipAt;
+			s_clipProjAt = sampleTimeDilated();
+			s_wantClip   = -1;
+			s_lastClock  = -1.0f;
+			s_shortRuns  = 0;
+			s_busyWait   = 0;
+
+			game::jumpProjectTo(seekTime(), 0);
+			s_wait = s_cfg.settleFrames;
+			s_step = Step::Settle;
+
+			logger::write("info",
+				"render: clip %d/%d at frame %d - project %.0f maps to clip time %.0f",
+				s_clipAt + 1, s_clipN, s_frame, s_clipProjAt, s_clipBase);
+		}
+
+		// Step to the next clip, carrying the project clock across the seam.
+		void advanceClip(float clipEnd)
+		{
+			const int next = s_clipAt + 1;
+
+			float lo = 0.0f, hi = 0.0f;
+			if (!game::clipRangeAt(next, lo, hi))
+			{
+				finish("finished - the next clip has no range", true);
+				return;
+			}
+
+			// The clip boundary almost never falls on a frame boundary, so the
+			// frame that crosses it is owed the remainder. rebaseClip() snaps to
+			// the new clip's first image instead, throwing away up to a frame of
+			// project time - once per boundary, all of it drift against the
+			// audio.
+			float over = seekTime() - clipEnd;
+			if (over < 0.0f)    over = 0.0f;
+			if (over > hi - lo) over = 0.0f;   // a clip shorter than one frame
+
+			s_wantClip   = next;
+			s_wantClipAt = lo + over;
+			s_clipWait   = 0;
+
+			if (!game::jumpToClip(next, s_wantClipAt))
+			{
+				finish("finished - could not step to the next clip", true);
+				return;
+			}
+
+			logger::write("info", "render: frame %d - stepping to clip %d/%d at %.0f",
+				s_frame, next + 1, s_clipN, s_wantClipAt);
+			s_step = Step::ClipJump;
+		}
+
+	}
+
+	Settings& settings() { return s_cfg; }
+
+	void installHooks()
+	{
+		if (game::addr_RenderSpinner)
+		{
+			memory(game::addr_RenderSpinner).hook(hkSpinner, &origSpinner, "RenderSpinner");
+			logger::write("info", "render: spinner suppression hooked");
+		}
+		else
+		{
+			logger::write("info", "render: spinner unresolved - loading spinners may be captured");
+		}
+
+		if (game::addr_DrawSpinner)
+		{
+			memory(game::addr_DrawSpinner).hook(hkDrawSpinner, &origDrawSpinner, "DrawSpinner");
+			logger::write("info", "render: spinner draw suppressed (the inlined-past one)");
+		}
+		else
+		{
+			logger::write("info",
+				"render: spinner draw unresolved - the editor's spinner stays");
+		}
+
+		if (game::addr_ScaleformDrawMovie)
+		{
+			memory(game::addr_ScaleformDrawMovie).hook(hkDrawMovie, &origDrawMovie, "ScaleformDrawMovie");
+			logger::write("info", "render: scaleform movie rendering suppressed during capture");
+		}
+		else
+		{
+			logger::write("info",
+				"render: the scaleform movie draw is unresolved - UI, including a "
+				"warning screen, may be captured");
+		}
+
+		if (game::addr_BusySpinnerOn)
+		{
+			memory(game::addr_BusySpinnerOn).hook(hkSpinnerOn, &origSpinnerOn, "BusySpinnerOn");
+			logger::write("info", "render: editor seek spinner suppressed at source");
+		}
+		else
+		{
+			logger::write("info",
+				"render: CBusySpinner::On unresolved - the editor's seek spinner stays");
+		}
+
+		if (game::addr_BusySpinnerRender)
+		{
+			memory(game::addr_BusySpinnerRender).hook(hkBusySpinner, &origBusySpinner, "BusySpinnerRender");
+			logger::write("info", "render: busy spinner suppression hooked");
+		}
+		else
+		{
+			logger::write("info", "render: busy spinner unresolved - it may be captured");
+		}
+
+		if (game::addr_MousePointerUpdate && game::addr_g_CursorVisible)
+		{
+			memory(game::addr_MousePointerUpdate).hook(hkPointer, &origPointer, "MousePointerUpdate");
+			logger::write("info", "render: cursor suppression hooked");
+		}
+		else
+		{
+			logger::write("info", "render: cursor update unresolved - cursor may be captured");
+		}
+	}
+
+	void applyConfig()
+	{
+		const Config& c = Config::get();
+
+		// s_cfg IS THE RUNNING RENDER'S SNAPSHOT. Never rewrite it under one.
+		//
+		// This is called from the export menu's row handler, which the editor also
+		// runs while a render is in flight - so pressing Export again, or nudging
+		// any render row, replaced the settings of a render already six frames in.
+		// Observed: a 128-sample render became a 32-sample one mid-flight, the
+		// speed controller fell back to its calibration seed against a shutter it
+		// had never measured, ten frames came out with the clip clock frozen, and
+		// the file finished 30/30 and was unusable. Nothing reported a problem
+		// because from every subsystem's point of view the numbers were valid -
+		// they were simply not the ones the render started with.
+		//
+		// The edit is not lost. s_cfgDirty replays it the moment the render goes
+		// idle, which is also when changing it can mean anything.
+		if (active())
+		{
+			s_cfgDirty = true;
+			logger::write("info",
+				"render: settings changed while a render is running (%d/%d frames) - "
+				"the render keeps the settings it started with; the new ones apply to "
+				"the next one.", s_frame, s_frames);
+			return;
+		}
+		s_cfgDirty = false;
+
+		s_cfg.fps          = c.renderFps;
+		s_cfg.samples      = c.renderSamples;
+		s_cfg.shutter      = c.renderShutter;
+		s_cfg.settleFrames = c.renderSettleFrames;
+		s_cfg.settleSubFrames = c.renderSettleSubFrames;
+		// JPEG is an image-SEQUENCE format, so it only means anything when the
+		// sequence is what you keep. In Video mode every frame is encoded,
+		// piped, decoded by ffmpeg and deleted - so a lossy intermediate costs
+		// quality in the master to save space on files nobody ever opens.
+		//
+		// Worse than it sounds: stb subsamples chroma at quality <= 90, so this
+		// quartered the colour resolution of the encode before the codec ever
+		// saw a pixel, and no downstream setting could get it back.
+		//
+		// Unconditional rather than a second toggle - there is no shot where a
+		// lossy transient is the right answer, so it is not a choice to offer.
+		s_cfg.jpeg         = c.renderJpeg && c.renderMode != Config::RenderMode::Video;
+		if (c.renderJpeg && !s_cfg.jpeg)
+		{
+			// Said once, not silently. A setting that is on in the ini and off in
+			// effect is exactly the kind of thing nothing else surfaces.
+			static bool told = false;
+			if (!told)
+			{
+				told = true;
+				logger::write("info",
+					"render: RenderJpeg is ignored in Video mode - the frames are transient, so they stay PNG. Set RenderMode=Frames if you want a JPEG sequence.");
+			}
+		}
+		s_cfg.quality      = c.renderQuality;
+		s_cfg.highlight    = c.renderHighlight;
+		s_cfg.captureMode  = c.renderCaptureMode;
+		s_cfg.dof          = c.renderDof;
+		s_cfg.dofBokehSize = c.renderDofBokehSize;
+		s_cfg.dofQuality   = c.renderDofQuality;
+		s_cfg.dofAutofocus = c.renderDofAutofocus;
+		s_cfg.dofFocusX    = c.renderDofFocusX;
+		s_cfg.dofFocusY    = c.renderDofFocusY;
+
+		// Depth-of-field mode samples the APERTURE, so the renderer's own
+		// sub-sample loop would sample the same instant again - once per pass,
+		// at tens of seconds each.
+		//
+		// Forced HERE, where the snapshot is built, and not in the config load:
+		// there the clamps run before RenderCaptureMode has been read, so the
+		// test saw the default and never fired. The symptom was a render that
+		// looked healthy - sessions cycling once a minute, frames being written -
+		// while sitting on frame 0 for an hour, rewriting frame_000000 with 64
+		// consecutive aperture sweeps of the same instant.
+		static int s_saidSamples = -1;
+		if (s_cfg.dof && s_cfg.samples != 1)
+		{
+			// Once per distinct value. applyConfig runs on every menu row change,
+			// and this filled the log with thirty identical lines while someone
+			// dialled the lens in.
+			const bool say = (s_saidSamples != s_cfg.samples);
+			s_saidSamples = s_cfg.samples;
+			if (say) logger::write("info",
+				"render: depth-of-field mode samples the aperture, so RenderSamples=%d "
+				"is ignored and treated as 1. Sample count comes from the add-on's bokeh "
+				"quality; RenderShutter still sets the exposure.", s_cfg.samples);
+			s_cfg.samples = 1;
+		}
+
+		// State the destination at startup, not only when a render begins.
+		//
+		// It was previously only in the "render: started ... -> <folder>" line,
+		// which is no use to anyone whose render never started - and that is
+		// exactly the person asking where the output went. It also moved with the
+		// path fix: under FiveM it now resolves beside the .asi in plugins\,
+		// rather than the subprocess cache older builds used, so even a working
+		// setup can have output in an unexpected place after an update.
+		{
+			static std::string s_lastReported;
+			const std::string dir =
+				fxcapture::captureBaseDir(Config::get().renderOutputFolder.c_str());
+			if (dir != s_lastReported)
+			{
+				s_lastReported = dir;
+				logger::write("info", "render: output -> %s\\render_NNNN%s",
+					dir.c_str(),
+					Config::get().renderOutputFolder.empty()
+						? "   (RenderOutputFolder is empty, so this is the default)"
+						: "   (from RenderOutputFolder)");
+			}
+		}
+	}
+
+	bool active()      { return s_step != Step::Idle; }
+	bool drivingDofPass() { return s_step != Step::Idle && s_cfg.dof; }
+	int  frameCount()  { return s_frames; }
+	int  frameDone()   { return s_frame; }
+	const char* outputFolder() { return s_folder; }
+
+	namespace
+	{
+		// Everything the render needs once a range is known.
+		//
+		// This used to take a `walkClips` flag, because there were two entry
+		// points: an export renders the PROJECT and must step through its clips,
+		// while a render started from the camera menu covered a marker range
+		// inside the clip being edited and had no business leaving it. That
+		// second entry point is gone with the menu row that reached it, so the
+		// flag could only ever be true and the clip walk is unconditional.
+		bool begin(float startMs, int frames, bool openEnded, const char** reason)
+		{
+			static const char* kNoFolder = "could not create the output folder";
+
+			// The frame pass of a two-pass render writes into the folder the
+			// audio pass already made, so the wav and the video end up together
+			// instead of one folder apart.
+			const size_t folderLen = strlen(s_folder);
+			const bool   reuse     = folderLen > 0 && !s_pendingWav.empty() &&
+			                         _strnicmp(s_pendingWav.c_str(), s_folder, folderLen) == 0;
+
+			if (!reuse &&
+			    !fxcapture::newSequenceFolder(Config::get().renderOutputFolder.c_str(),
+			                                  s_folder, sizeof(s_folder)))
+			{
+				if (reason) *reason = kNoFolder;
+				return false;
+			}
+
+			if (s_cfg.fps     < 1.0f) s_cfg.fps = 1.0f;
+			if (s_cfg.samples < 1)    s_cfg.samples = 1;
+
+			s_dt        = 1000.0f / s_cfg.fps;
+			s_start     = startMs;
+			s_frames    = frames;
+
+			// Is the SUB-SAMPLE step still representable where this render ends?
+			//
+			// The clip clock is a float and so is the seek that consumes it, so
+			// the finest step that means anything is one ULP at the magnitude in
+			// play - and the magnitude is the time INTO the clip, which grows as
+			// the render proceeds. Late in a long clip the ULP is coarse:
+			// ~0.0036ms at 30s, ~0.0076ms at 60s.
+			//
+			// The step between sub-samples is dt*shutter/N, and at a high frame
+			// rate with a high sample count that lands in the same territory.
+			// Nothing errors when it does - consecutive sub-samples simply round
+			// to the same instant and the blur silently stops getting finer, which
+			// is indistinguishable from "this scene has little motion" unless you
+			// know to look. So say it up front rather than let someone conclude
+			// the sample count does nothing.
+			if (s_cfg.samples > 1)
+			{
+				const float endMs = startMs + (openEnded ? 0.0f : (float)frames * s_dt);
+				const float ulp   = (endMs > 1.0f ? endMs : 1.0f) * 1.1920929e-7f; // 2^-23
+				const float step  = s_dt * s_cfg.shutter / (float)s_cfg.samples;
+
+				if (step < ulp * 8.0f)
+				{
+					logger::write("info",
+						"render: sub-sample step is %.5fms but the clip clock only resolves "
+						"~%.5fms this far in (%.1fs) - the last samples of each frame will "
+						"land on the same instant and the blur stops refining. Fewer samples, "
+						"a lower frame rate, or a shorter clip would all fix it.",
+						step, ulp, endMs * 0.001f);
+				}
+			}
+			s_frame     = 0;
+			s_sample    = 0;
+			s_openEnded = openEnded;
+			s_shortRuns = 0;
+			s_lastClock  = -1.0f;
+			s_modeWait  = 0;
+			s_busyWait  = 0;
+			s_startMode = game::replayMode();
+
+			// The project's clips. Zero means we could not read them and every
+			// clip-aware path below falls back to the old guesswork - which is
+			// what a build with an unresolved playback controller gets.
+			s_clipAt   = 0;
+			s_clipN    = 0;
+			s_wantClip = -1;
+			s_clipWait = 0;
+			{
+				const int at = game::clipIndex();
+				if (at >= 0)
+				{
+					s_clipAt = at;
+					s_clipN  = game::clipCount();
+				}
+			}
+
+			// Audio pass. Plays the project through at normal speed and records
+			// it; no seeking, no frames, and deliberately no dependency on the
+			// capture addon, so sound works without ReShade installed.
+			if (Config::get().renderAudio && s_pendingWav.empty())
+			{
+				if (audioout::begin(s_folder))
+				{
+					s_audioPass  = true;
+					s_clockStillTick = 0;
+					s_lastClock  = -1.0f;
+					game::playbackSetSpeed(1.0f);   // ONLY 1.0 - the audio engine
+					game::playbackPlay();           // misbehaves at any other rate
+					s_step = Step::Audio;
+					logger::write("info",
+						"render: AUDIO pass - playing the project through at normal speed, "
+						"the frame pass follows on its own");
+					return true;
+				}
+				logger::write("info", "render: audio capture unavailable - rendering silent");
+			}
+			if (!s_pendingWav.empty()) videoout::setAudio(s_pendingWav.c_str());
+
+			fxcapture::setQuality(s_cfg.quality);
+			fxcapture::setHighlightBoost(s_cfg.highlight);
+
+			// Pause first: every frame time from here is one we chose. If playback
+			// kept running, the clock would move between our jump and the addon's
+			// grab and the shutter would no longer mean anything.
+			game::playbackPause();
+			s_clipBase = s_clipProjAt = 0.0f;   // identity until the clip is known
+			s_firstLo  = s_firstHi = -1.0f;
+			s_looped   = false;
+			rebaseClip("start");
+			game::jumpProjectTo(seekTime(), 0);
+
+			s_slideTime   = 0.0;
+			s_slideSample = 0;
+			s_slideFlush  = false;
+			s_fxStep      = false;
+			s_clockStillTick = 0;   // doubles as the sliding clock-stall counter
+
+			// Take the editor's HUD down for the duration. Same flag the
+			// hide-HUD key uses, so this is the game's own path - and Open()
+			// sets it back to true on the next playback either way.
+			if (Config::get().renderHideHud)
+			{
+				game::setEditorHudVisible(false);
+				game::setCursorVisible(false);
+			}
+
+			// Started here, once s_folder and the settings are final, so the
+			// encoder's frame rate is the one actually being rendered at.
+			videoout::begin(s_folder, s_cfg.fps);
+
+			s_startTick  = GetTickCount();
+			s_lastReport = s_startTick;
+			s_lastBeat = fxcapture::heartbeat();
+
+			// Sliding: let the clip PLAY, slowly, and take whatever is presented.
+			//
+			// The seek above still ran, and is still wanted - it puts the playhead
+			// at the start before anything rolls. From here the engine drives the
+			// clock, including stepping clips on its own, exactly as it does for
+			// the audio pass.
+			// THE LENS TAKES THE WALKING STATE MACHINE, whichever mode is set.
+			//
+			// A depth-of-field frame is one request to the add-on, waited on and then
+			// captured - Settle -> DofPass -> Ack. Sliding's loop instead exposes
+			// sub-frames itself and never asks for a pass at all, so entering it with
+			// the lens on produced a plain render with the add-on untouched.
+			//
+			// What sliding contributes is the CLOCK: the stepper is begun below so
+			// DofPass can advance time between aperture samples. That is the whole
+			// difference between the two flavours - the state machine is shared.
+			if (s_cfg.dof && s_cfg.captureMode == 1)
+			{
+				// Step 0 for now: the size depends on the add-on's sample count, which
+				// only exists once a pass has been asked for.
+				s_fxStep      = game::fixedTimeBegin(0.0f);
+				s_fxSampleMs  = 0.0f;
+				s_fxGapMs     = 0.0f;
+				logger::write("info",
+					"render: sliding + depth of field - the clock %s between aperture "
+					"samples, so the world keeps moving through each exposure.",
+					s_fxStep ? "steps"
+						: "CANNOT step (no exact stepping on this build), so the "
+						  "world is frozen exactly as it is in walking");
+			}
+			else if (s_cfg.captureMode == 1 && !s_cfg.dof)
+			{
+				// A seed, not a setting. The advance phase of the first frame
+				// measures what one present is worth and solves for the real
+				// speed before anything is exposed, so this only has to be
+				// somewhere the clip visibly moves and nothing more.
+				s_slideSpeed  = kSlideSeed;
+				s_slideCalib  = false;
+				s_slideWarm   = 0;
+				s_slideWarmT0 = 0;
+				s_slideWarmN0 = 0;
+				s_slidePerPresent = 0.0;
+				s_slideStepOk = true;
+				s_slideToldRemeasure = false;
+				s_slideStep   = 0.0;
+				s_slideCapture = false;
+				s_slideLogged = 0;
+				s_slideToldReach = false;
+				// Per render, like everything else here: a present interval carried
+				// over from the previous one would be measured on a different scene.
+				s_slideRealStep  = 0.0;
+				s_slideLastQpc   = 0;
+				// PLAY FIRST, THEN THE RATE - the order is the whole thing.
+				//
+				// playbackPlay() is SetNextPlayBackState(PLAY_FWD), and the engine
+				// restores ITS OWN saved speed on a state change - the note on the
+				// clip transition below already says so. Setting our rate and then
+				// asking it to play threw the rate away on the same tick, so the clip
+				// ran at 1.0x for the whole render: every calibration measured 1.0x,
+				// and on a 6.2s clip playback reached the END during warm-up, which
+				// is what 'STOPPED SHORT at 1 of 188 frames' actually was.
+				//
+				// SetCursorSpeed issues the play state itself, so this order is not
+				// just safe but redundant in the right direction: state first, then
+				// the rate that must survive it.
+				game::playbackPlay();
+				game::playbackSetSpeed(s_slideSpeed);
+				s_lastClock = -1.0f;
+				s_step      = Step::Slide;
+				// Can the engine step this deterministically instead?
+				//
+				// Reported, not used yet. The gate needs a LIVE playback controller,
+				// and nothing guarantees one is registered once RE+ has diverted the
+				// stock bake - that single fact decides whether the fixed-step rewrite
+				// is possible at all, and a render can answer it for free.
+				// EXACT STEPPING, if the engine will give it to us.
+				//
+				// Everything below this - the warm-up, the calibration, the speed
+				// controller, the clock-resolution floor - exists to guess a clock we
+				// cannot command. Here we can. The replay advances by exactly the step
+				// we hand it, derived from an ABSOLUTE nanosecond accumulator, so a
+				// sub-sample too small for the float clock is carried into the next
+				// frame's delta rather than lost. That is precisely why this path needs
+				// no floor - with a speed, a step that rounds away is gone forever.
+				//
+				// The engine also does three things here we hand-rolled worse:
+				// ConvertTimeToNonDilatedTimeMs applies marker speed per clip, the
+				// clip-boundary clamp carries the remainder into the next clip, and
+				// AddVideoTimeNs keeps audio on the same nanosecond count.
+				{
+					const int   n  = s_cfg.samples < 1 ? 1 : s_cfg.samples;
+					const float ex = s_dt * s_cfg.shutter;      // exposed part of a frame
+					s_fxSampleMs   = ex / (float)n;
+					s_fxGapMs      = s_dt - ex;                 // 0 at a 360-degree shutter
+					s_fxStep       = game::fixedTimeBegin(s_fxSampleMs);
+
+					if (s_fxStep)
+					{
+						s_slideCalib = true;   // nothing to calibrate - the step is stated
+						logger::write("info",
+							"render: SLIDING (exact) - the engine steps the replay %.4fms per "
+							"sub-sample, %d of them, then %.4fms with the shutter closed. No "
+							"speed request, no calibration, no clock floor.",
+							s_fxSampleMs, n, s_fxGapMs);
+					}
+					else
+					{
+						logger::write("info",
+							"render: exact stepping unavailable (no live playback controller, "
+							"or not resolved on this build) - pacing by playback speed instead.");
+					}
+				}
+
+				// Only when WE are pacing - the exact path prints its own line, and
+				// this one's "starting at 0.005x / self-tunes" is a lie there.
+				if (!s_fxStep) logger::write("info",
+				"render: SLIDING - %d sample(s) per frame at a %.0f-degree shutter, "
+					"starting at %.3gx. The clip plays, so particles and any temporal "
+					"accumulation stay live; the speed self-tunes so the samples span "
+					"the shutter.",
+					s_cfg.samples < 1 ? 1 : s_cfg.samples, s_cfg.shutter * 360.0f,
+					s_slideSpeed);
+				return true;
+			}
+
+			s_wait     = s_cfg.settleFrames;
+
+			// KNOWN, and not the settle. The first depth-of-field pass of a
+			// render measures its focus somewhere the later ones do not - 10.25 m
+			// against a steady 2.73 m for every frame after it. Settling frame 0
+			// for a full second first was tried on the theory that the world was
+			// still streaming back after the rewind to clip 1, and changed
+			// nothing, so that is not the cause. Left alone rather than papered
+			// over; frame 0 is one frame and the rest of the render is right.
+			s_step     = Step::Settle;
+			return true;
+		}
+	}
+
+	bool startOpenEnded(const char** reason)
+	{
+		static const char* kNoAddon = "capture addon not loaded";
+		static const char* kBusy    = "already rendering";
+
+		if (s_step != Step::Idle) { if (reason) *reason = kBusy; return false; }
+
+		fxcapture::init();
+		if (!fxcapture::addonPresent()) { if (reason) *reason = kNoAddon; return false; }
+
+		const float now = game::addr_g_ReplayTimeMs ? *(float*)game::addr_g_ReplayTimeMs : 0.0f;
+		if (s_cfg.fps < 1.0f) s_cfg.fps = 1.0f;
+
+		// How long the project is, measured off its clip table.
+		//
+		// Every clip's own span, added up, in exactly the units the render steps
+		// through - so the count below is the project, not an estimate of it.
+		//
+		// The wav used to be the only measurement available and it is the wrong
+		// one twice over. It is REAL elapsed time, so it carries whatever loading
+		// the gate did not catch; and if the audio pass ended early - which it
+		// did, on every multi-clip project, because a looping preview never
+		// stopped the clock - the frame pass inherited the truncation and stopped
+		// mid-project. It is kept below only for builds that cannot read clips.
+		//
+		// The count is a bound, not the stopping rule: the render ends when it
+		// runs off the end of the LAST clip, which is why there is slack on it.
+		const char* source    = nullptr;
+		int         frames    = 0x7FFFFFFF;
+		bool        openEnded = true;
+		float       totalMs   = 0.0f;
+
+		// DILATED duration, because the render clock is now dilated too.
+		//
+		// The per-clip spans below are non-dilated - the AUTHORED length - and
+		// those two are the same number only while every marker sits at 100%.
+		// Counting frames from the authored length on a project with a 50% section
+		// asks for half the frames that section needs, and the render stops short
+		// of the end.
+		const int clips = game::clipCount();
+		const bool useDilated = Config::get().renderMarkerSpeed;
+
+		if (useDilated) totalMs = game::totalDilatedMs();
+
+		if (totalMs > 1.0f)
+		{
+			source = "from the clip table (real duration)";
+		}
+		else
+		{
+			// Either dilation is switched off, or the controller could not answer.
+			// The authored span is the right answer in the first case and the only
+			// available one in the second.
+			totalMs = 0.0f;
+			for (int i = 0; i < clips; ++i)
+			{
+				float lo = 0.0f, hi = 0.0f;
+				if (game::clipRangeAt(i, lo, hi)) totalMs += hi - lo;
+			}
+			if (totalMs > 1.0f) source = "from the clip table";
+		}
+
+		if (totalMs > 1.0f)
+		{
+			frames    = (int)(totalMs / (1000.0f / s_cfg.fps) + 0.5f) + 2;
+			openEnded = false;
+		}
+		else if (!s_pendingWav.empty() && audioout::seconds() > 0.05)
+		{
+			frames    = (int)(audioout::seconds() * s_cfg.fps + 0.5);
+			totalMs   = (float)(audioout::seconds() * 1000.0);
+			openEnded = false;
+			source    = "from the audio pass";
+		}
+
+		// An unreadable clip table is a QUIET failure, and it is the one that
+		// produces "the render doesn't work" reports.
+		//
+		// clipCount() answers through the playback controller, whose montage
+		// pointer is only populated once the project has actually been loaded
+		// for playback. Read it too early and the project honestly reports zero
+		// clips - at which point everything downstream degrades instead of
+		// stopping: the frame count becomes unbounded, s_clipN is 0, so
+		// JumpToClip is never issued and the render ends at the first clip
+		// boundary. On a single-clip project that is invisible; on a multi-clip
+		// one you get clip one and nothing else, with no line anywhere saying so.
+		//
+		// It stays a fallback rather than becoming an abort - a render that
+		// covers one clip beats one that refused - but it says what happened,
+		// which is the whole difference between this and a bug report.
+		if (clips <= 0 || totalMs <= 1.0f)
+			logger::write("info",
+				"render: !! the project's clip table read %d clip(s)/%.0fms - rendering "
+				"OPEN-ENDED from the playhead. Multi-clip stepping is OFF, so this will "
+				"stop at the end of the current clip. This usually means the project was "
+				"not fully loaded for playback; open it in the editor first, then Export.",
+				clips, totalMs);
+
+		if (!begin(now, frames, openEnded, reason)) return false;
+		s_fromExport = true;
+
+		// Capture mode and shutter belong on this line. Without them a log shows
+		// "1 sample(s)" and a render that took three minutes, with nothing to say
+		// whether that was walking being slow or sliding being broken - and those
+		// have completely different causes. Reconstructing it from the ini is not
+		// the same thing: the ini is what it says NOW, not what that render ran.
+		// The lens is a MODIFIER now, so the line has to name both axes - which
+		// one gathers time and whether an aperture is involved.
+		const char* const mode =
+			s_cfg.dof ? (s_cfg.captureMode == 1 ? "sliding + depth of field"
+				                                    : "walking + depth of field")
+			          : (s_cfg.captureMode == 1 ? "sliding" : "walking");
+
+		// Said once, up front, because the cost is not guessable from the
+		// settings: every output frame is a whole aperture sweep, so a figure
+		// people expect in minutes lands in hours. Better to see it in the log at
+		// frame 0 than to work it out from the ETA at frame 6.
+
+		if (s_cfg.dof)
+		{
+			// The lens, stated at the start of the render.
+			//
+			// These live in three places - this menu, Render.ini, and the
+			// add-on's own panel - and the whole point of pushing them is that
+			// the first two win. Printing what was actually sent is the only way
+			// to tell a setting that did not reach the add-on from one that
+			// reached it and did nothing.
+			logger::write("info",
+				"render: lens - aperture %.3f, %d rings, autofocus %s at %.2f,%.2f, "
+				"highlight %.2f. These are pushed to the add-on; its own panel values "
+				"for these are not used.",
+				s_cfg.dofBokehSize, s_cfg.dofQuality,
+				s_cfg.dofAutofocus ? "on" : "off",
+				s_cfg.dofFocusX, s_cfg.dofFocusY, s_cfg.highlight);
+
+			if (s_cfg.dofAutofocus && !worldprobe::available())
+				logger::write("info",
+					"render: !! autofocus is ON but the world query is unavailable on this "
+					"build - UpdateCollision did not resolve, and the probe's addresses are "
+					"derived from it. Focus will stay wherever the add-on's panel last put "
+					"it. Another mod hooking that function is the usual cause; check the "
+					"'Pattern ... not found' line near the top of this log.");
+
+			logger::write("info",
+				"render: DEPTH OF FIELD - each frame is accumulated across a real "
+				"aperture by the add-on, not blurred afterwards. Shutter %.0f ms of "
+				"clip time per frame. This is the slow one: a pass is tens of seconds, "
+				"so expect hours rather than minutes, and leave it alone while it runs.",
+				dofShutterMs());
+		}
+
+		// No shutter angle when there is no blur. Printing "1 sample(s) @ 360 deg"
+		// states a setting that reaches nothing, and a log that reports inactive
+		// settings as if they applied is how an afternoon gets spent wondering why
+		// changing one made no difference.
+		char blur[96];
+		if (s_cfg.dof)
+			// NOT "no motion blur", which is what this said and it was wrong: the
+			// aperture samples are spread across the shutter, so a pass carries
+			// blur as well as bokeh. Samples being 1 describes the renderer's own
+			// loop, not the exposure.
+			snprintf(blur, sizeof(blur), "blur from the aperture @ %.0f deg",
+				s_cfg.shutter * 360.0f);
+		else if (s_cfg.samples > 1)
+			snprintf(blur, sizeof(blur), "%d sample(s) @ %.0f deg",
+				s_cfg.samples, s_cfg.shutter * 360.0f);
+		else
+			snprintf(blur, sizeof(blur), "no motion blur");
+
+		if (openEnded)
+			logger::write("info",
+				"render: export started at %.2fs @ %.3g fps, %s, %s, "
+				"replayMode=%d -> %s",
+				now * 0.001f, s_cfg.fps, mode, blur, s_startMode, s_folder);
+		else
+			logger::write("info",
+				"render: export started at %.2fs @ %.3g fps, %s, %s, "
+				"%d clip(s), %d frames (%.2fs, %s), replayMode=%d -> %s",
+				now * 0.001f, s_cfg.fps, mode, blur,
+				s_clipN, frames, totalMs * 0.001f, source, s_startMode, s_folder);
+		return true;
+	}
+
+	void cancel()
+	{
+		if (s_step == Step::Idle) return;
+		finish("cancelled", false);
+	}
+
+	// Escape stops the render.
+	//
+	// cancel() existed, was declared in the header, and had no caller anywhere,
+	// so a running render could not be stopped at all. Escape therefore went
+	// where it always goes - to the editor, which asks whether to leave for the
+	// Project Menu - and the render carried on behind that dialog, accumulating
+	// it into every frame until the question was answered.
+	//
+	// The key is not consumed (there is no input hook), so the editor still gets
+	// it and still asks. Harmless once we stop first: the render is over before
+	// the dialog is drawn, so no frame can contain it, and answering "No" just
+	// returns to a cancelled render.
+	//
+	// Foreground-checked, because GetAsyncKeyState is global and a render is
+	// exactly when someone alt-tabs away - an Escape pressed in another window
+	// must not reach this. Edge-triggered so a held key fires once.
+	bool escapePressed()
+	{
+		static bool down = false;
+
+		bool now = false;
+		if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
+		{
+			DWORD pid = 0;
+			GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+			now = (pid == GetCurrentProcessId());
+		}
+
+		const bool edge = now && !down;
+		down = now;
+		return edge;
+	}
+
+	void pump()
+	{
+		// Polled every frame, not only while rendering, so the held/released
+		// state stays true across a render boundary and the first Escape of the
+		// next render is still an edge.
+		const bool escape = escapePressed();
+
+		// Presents per output frame, for the depth-of-field log. The whole
+		// difference between a lens render and every other kind is how many of
+		// these one frame costs, so it is worth stating rather than inferring
+		// from the add-on's sample count.
+		if (s_step != Step::Idle) ++s_dofPresents;
+
+		if (active() && escape)
+		{
+			logger::write("info", "render: Escape at frame %d/%d - cancelling", s_frame, s_frames);
+			cancel();
+			return;
+		}
+
+		// --- export diagnostics ------------------------------------------
+		//
+		// "I pressed Export, it rendered the vanilla watermarked video, and the
+		// log says nothing" was unanswerable: every interesting fact was either
+		// logged once at startup or not at all. These three cover the ways it
+		// can fail without anyone noticing.
+		{
+			// 1. The addon coming and going. Reported once at init as "not seen
+			//    yet" and never again, so an addon that loads later - or dies
+			//    mid-session - left no trace at all.
+			static int  s_addonWas  = -1;
+			static bool s_saidInEd  = false;
+			const int   addonNow    = fxcapture::addonPresent() ? 1 : 0;
+			if (addonNow != s_addonWas)
+			{
+				if (s_addonWas != -1 || !addonNow)
+					logger::write("info",
+						"capture: addon %s (heartbeat=%u). Rendering needs this alive.",
+						addonNow ? "is now PRESENT" : "is NOT presenting",
+						fxcapture::heartbeat());
+				s_addonWas = addonNow;
+				s_saidInEd = false;   // re-state it once we are in the editor
+			}
+
+			// Say it AGAIN, once, when the editor is actually open.
+			//
+			// The startup report is ~1s into the process, long before ReShade
+			// necessarily has a device, so "not presenting" there means little -
+			// and a user reading their log sees one stale line and concludes
+			// nothing. Restating it at the moment rendering could be requested is
+			// the one that answers "why did Export fall back".
+			if (!s_saidInEd && game::isEditModeActive() && Config::get().enableRenderer)
+			{
+				s_saidInEd = true;
+
+				// Re-check WHICH ReShade, for the same reason this whole block
+				// exists. The startup scan runs before ReShade is necessarily in
+				// the module list, so it can report "no ReShade in this process"
+				// at a machine that plainly has one - and that line then stands
+				// unchallenged for the rest of the session. hostState() logs only
+				// when the answer changes, so a correct startup guess costs
+				// nothing here and a wrong one gets superseded.
+				fxcapture::hostState();
+
+				if (fxcapture::addonPresent())
+					logger::write("info",
+						"capture: editor open, addon PRESENT (heartbeat=%u) - Export will "
+						"render with RE+", fxcapture::heartbeat());
+				else
+					logger::write("info",
+						"capture: editor open but the addon is NOT presenting (channel=%s, "
+						"heartbeat=0). Export WILL fall back to the game's own encoder. "
+						"Rendering needs ReShade WITH FULL ADD-ON SUPPORT plus the "
+						"IgcsConnector.addon64 BUNDLED WITH THIS MOD - any other one lacks "
+						"the capture channel and will present without ever grabbing a "
+						"frame. If both are right, check the add-on is enabled and that "
+						"nothing else (ENB) owns present.",
+						fxcapture::available() ? "mapped" : "NOT MAPPED");
+			}
+
+			// 2. Someone patching over our Open detour. Silent today: MinHook
+			//    reported success, the log said "hooked", and the bytes are gone.
+			//
+			//    Only meaningful once the detour was actually WRITTEN. Reported
+			//    without that check it blamed another mod for a hook that had
+			//    simply failed to install - which is a different problem with a
+			//    different fix, and the install failure has already said so
+			//    several hundred lines earlier.
+			static bool s_saidClobbered = false;
+			if (!s_saidClobbered && game::addr_PlaybackOpen &&
+			    exporthook::hookInstalled() && !exporthook::hookIntact())
+			{
+				s_saidClobbered = true;
+				logger::write("info",
+					"export: !! our Open detour is no longer at %p - it installed and "
+					"something has since patched over it. Export will not reach RE+.",
+					(void*)game::addr_PlaybackOpen);
+			}
+
+			// 3. THE symptom, stated outright. If the game enters a bake that did
+			//    not come through our hook, the vanilla encoder is running and we
+			//    never saw the press - which is exactly the report we could not
+			//    diagnose. Say so, with every precondition, at the moment it
+			//    happens.
+			if (game::addr_g_PlaybackType)
+			{
+				const int t = *(int*)game::addr_g_PlaybackType;
+
+				// SEED on the first observation, never judge it.
+				//
+				// The first version evaluated the bake test on the very first
+				// read, and this global holds 1 at startup on at least some
+				// builds - so it fired one millisecond after init, eight seconds
+				// before the user had even opened the editor, and announced that
+				// the hook was on the wrong function. It was not; Export simply
+				// had not been pressed. Only a TRANSITION into bake means
+				// anything.
+				if (s_lastType == -2)
+				{
+					s_lastType = t;
+				}
+				else if (t != s_lastType)
+				{
+					const int prev = s_lastType;
+					s_lastType = t;
+					logger::write("info", "export: playback type %d -> %d", prev, t);
+
+					if (t == gsig::PLAYBACK_TYPE_BAKE && !exporthook::pending() &&
+					    s_step == Step::Idle)
+					{
+						logger::write("info",
+							"export: !! entered a BAKE we did not divert - this is the "
+							"vanilla encoder. Open intercepted %u time(s), detour %s, "
+							"renderer=%s, addon=%s, heartbeat=%u, channel=%s.",
+							exporthook::openCount(),
+							exporthook::hookIntact() ? "intact" : "OVERWRITTEN",
+							Config::get().enableRenderer ? "on" : "off",
+							fxcapture::addonPresent() ? "present" : "not presenting",
+							fxcapture::heartbeat(),
+							fxcapture::available() ? "mapped" : "NOT MAPPED");
+
+						if (!fxcapture::addonPresent())
+							logger::write("info",
+								"export:    the addon is not presenting, so this fallback is "
+								"BY DESIGN - see the capture line above. Fix ReShade/IGCS, "
+								"not the renderer.");
+						else if (exporthook::openCount() == 0)
+							logger::write("info",
+								"export:    Open was never intercepted, so the hook is on the "
+								"wrong function for this build.");
+					}
+				}
+			}
+		}
+
+		// An Export press that arrived while a render was ALREADY running.
+		//
+		// pending() is only consumed by the block below, and that block requires
+		// Idle - so a press during a render was latched and then fired the instant
+		// the render ended, starting a second one nobody asked for. From that
+		// point the cycle is permanently offset: every later press is absorbed by
+		// the phantom already running, its frames land in the PREVIOUS press's
+		// folder, and the newest folder in Captures is always the phantom - a
+		// zero-byte wav and no frames.
+		//
+		// That is exactly the "the render produced nothing" report. It is not the
+		// render that is broken; it is which folder the output went to.
+		//
+		// DROPPED, not queued. The phantom starts from wherever the finished
+		// render left the playhead - the end of the last clip - so it has nothing
+		// left to render even in principle, and two exports back to back is never
+		// what the press meant.
+		if (s_step != Step::Idle && exporthook::pending())
+		{
+			exporthook::clearPending();
+			s_pendWait = 0;
+			s_pendStart = 0;
+			logger::write("info",
+				"export: Export pressed while a render was already running "
+				"(%d/%d frames) - ignoring the press, the render in progress "
+				"continues. Press it again once this one finishes.",
+				s_frame, s_frames);
+		}
+
+		// A diverted Export lands here: Open() has returned, but playback needs
+		// a few frames before the replay clock is usable, so we retry rather
+		// than starting from inside the hook.
+		if (s_step == Step::Idle && exporthook::pending())
+		{
+			// The seek we rely on refuses to move unless the replay mode is EDIT,
+			// and Open() leaves it mid-transition for a while. Starting during
+			// that window is what made the first attempt abort instantly.
+			//
+			// Bounded by WALL CLOCK, not by a frame count. It used to give up
+			// after 900 pump() calls, described in a comment as "~15s at 60fps" -
+			// which is only true at 60fps. A user reported this failing after
+			// 4.8 seconds, because their machine was running the editor fast
+			// enough to burn 900 frames in that time. The thing being waited on is
+			// a savegame-queue commit (REPLAYMODE_WAITINGFORSAVE, which is what
+			// TriggerPlayback sets on the way into playback) and that takes as
+			// long as the disk takes, entirely unrelated to frame rate.
+			// WAIT, do not race a timer.
+			//
+			// A short bound here is simply wrong. Loading and precaching take as
+			// long as the install takes - minutes on a heavily modded setup - and
+			// giving up does not fall back to anything: the bake was already
+			// diverted, so an abort costs the user the export entirely and they
+			// have to press Export again. The people most likely to be cut off
+			// are exactly the ones with the most content to stream.
+			//
+			// So wait for as long as the editor is still somewhere a render makes
+			// sense, and report progress instead of sitting silent. The backstop
+			// exists only to stop a genuine hang pending forever; it is not a
+			// judgement about how long loading is allowed to take.
+			if (game::replayMode() != gsig::REPLAYMODE_EDIT || game::replayBusy())
+			{
+				const unsigned long now = GetTickCount();
+				if (s_pendStart == 0) { s_pendStart = now; s_pendLog = now; }
+
+				const int   mode = game::replayMode();
+				const char* busy = game::replayBusyReason();
+
+				// The editor closed under us - nothing left to render into.
+				if (mode == gsig::REPLAYMODE_DISABLED)
+				{
+					exporthook::clearPending();
+					s_pendWait = 0; s_pendStart = 0;
+					logger::write("info",
+						"export: not rendering - the editor closed while waiting to start");
+					return;
+				}
+
+				// Say what we are waiting on, every 5s, so a long wait looks like
+				// a long wait rather than a hang.
+				if (now - s_pendLog >= 5000)
+				{
+					s_pendLog = now;
+					logger::write("info",
+						"export: waiting to start - mode=%s(%d)%s%s, %us elapsed",
+						gsig::replayModeName(mode), mode,
+						busy ? ", busy on " : "", busy ? busy : "",
+						(unsigned)((now - s_pendStart) / 1000));
+				}
+
+				if (now - s_pendStart > 300000)   // 5 min backstop
+				{
+					exporthook::clearPending();
+					s_pendWait = 0; s_pendStart = 0;
+					logger::write("info",
+						"export: giving up after 5 minutes - mode=%s(%d)%s%s. This is a "
+						"backstop against a hang, not a loading limit; if the editor was "
+						"still legitimately streaming, press Export again once it settles.",
+						gsig::replayModeName(mode), mode,
+						busy ? ", busy on " : "", busy ? busy : "");
+				}
+				return;
+			}
+			if (s_pendStart != 0)
+				logger::write("info", "export: replay ready after %us - starting",
+					(unsigned)((GetTickCount() - s_pendStart) / 1000));
+			s_pendStart = 0;
+
+			// Do not start until the playhead is at the beginning of the PROJECT.
+			//
+			// A reopened playback reports the clock wherever the previous pass
+			// left it - after an audio pass that is the END of a clip - and the
+			// engine then advances to the NEXT clip on its own before our first
+			// seek lands. The render came out starting at clip two, ran to the
+			// wrap, and stopped one clip short. Waiting here for the playhead to
+			// come home costs a few frames and removes the whole class of
+			// problem.
+			//
+			// Clip ONE, not just the start of whatever clip is on screen. That
+			// was all this could ask for before - a seek clamps to the current
+			// clip - so pressing Export while editing clip three rendered clips
+			// three onwards and called it the project.
+			{
+				float lo = 0.0f, hi = 0.0f;
+				if (game::clipRangeAt(0, lo, hi) && game::addr_g_ReplayTimeMs)
+				{
+					const float now = *(float*)game::addr_g_ReplayTimeMs;
+					const int   at  = game::clipIndex();
+
+					if (at > 0 || now > lo + 250.0f)
+					{
+						if (s_pendWait == 0 || (s_pendWait % 30) == 0)
+							rewindToProjectStart();
+						if (++s_pendWait <= 900) return;
+
+						logger::write("info",
+							"export: playhead would not return to the project start "
+							"(clip %d, clock %.0f, clip 1 starts %.0f) - rendering from here anyway",
+							at, now, lo);
+					}
+				}
+			}
+
+			const char* why = nullptr;
+			if (startOpenEnded(&why))
+			{
+				exporthook::clearPending();
+				s_pendWait = 0;
+			}
+			else if (++s_pendWait > 900) // ~15s at 60fps
+			{
+				exporthook::clearPending();
+				s_pendWait = 0;
+				logger::write("info", "export: could not start the render - %s", why ? why : "?");
+			}
+			return;
+		}
+
+		if (s_step == Step::Idle) return;
+
+		// Re-assert every frame: the editor's own update writes both of these
+		// flags too, so setting them once at start is not enough to keep them
+		// down - the cursor especially, which the input code rewrites whenever
+		// the mouse moves.
+		//
+		// Hoisted to the top of the active path so it covers the AUDIO pass as
+		// well. It used to sit inside the frame-pass switch, which the audio
+		// case returns before ever reaching, so a pass that records sound left
+		// the whole editor HUD on screen - and since that pass plays the project
+		// at normal speed, it was the one you actually sat and watched.
+		//
+		// It also has to be above the mode-hold and transition returns below,
+		// or the HUD would blink back on at every clip boundary.
+		if (Config::get().renderHideHud)
+		{
+			game::setEditorHudVisible(false);
+			game::setCursorVisible(false);
+		}
+
+		// Leaving the editor mid-render invalidates everything below.
+		//
+		// Compared against the mode we STARTED in, not against REPLAYMODE_EDIT:
+		// an export runs as a full-project preview, which is a different mode,
+		// so testing for EDIT killed every export render on its first frame.
+		// A clip boundary is a MODE CHANGE, not an exit. Aborting on any change
+		// ended every multi-clip render at the first boundary - after a full,
+		// correct first clip, which is what made it read as an end-of-project
+		// problem rather than a transition one.
+		//
+		// The rule is "it has to come back", applied to EVERY value including
+		// DISABLED. Keying on specific mode numbers would be guesswork: the
+		// engine drives clip transitions through its replay STATE bits
+		// (CLIP_TRANSITION_REQUEST / _LOAD), and sm_uMode is only along for the
+		// ride, so which value it lands on mid-transition is not something we
+		// can assume. Waiting for the mode to return is true regardless.
+		//
+		// DISABLED gets a much shorter leash than the rest, because it is the
+		// one value that is also the genuine "user left the editor" signal, and
+		// there we want to stop promptly rather than sit for a minute.
+		const int mode = game::replayMode();
+		if (mode != s_startMode)
+		{
+			const int guard = (mode == gsig::REPLAYMODE_DISABLED) ? kExitGuard : kModeGuard;
+			if (++s_modeWait <= guard)
+			{
+				// Stop recording before returning: this branch runs BEFORE the
+				// audio case below, so without it the load would be captured as
+				// however many seconds of silence and everything after the first
+				// clip would sit that far behind the picture.
+				if (s_step == Step::Audio) audioout::gate(false);
+
+				// Logged on the first frame of every change: when this aborts a
+				// render, the mode VALUE is the whole diagnosis, and the earlier
+				// version threw it away and just said "left the editor".
+				if (s_modeWait == 1)
+					logger::write("info",
+						"render: replay mode %d -> %d at frame %d - holding (up to %d frames)",
+						s_startMode, mode, s_frame, guard);
+				s_wait = s_cfg.settleFrames;   // never composite a loading screen
+				return;
+			}
+			logger::write("info", "render: replay mode stuck at %d for %d frames - giving up",
+				mode, s_modeWait);
+			finish("aborted - left the editor", false);
+			return;
+		}
+
+		// Back from a transition: re-assert the render's playback state.
+		//
+		// The pause set at the start of the render belongs to the clip we
+		// started in. A clip transition runs the engine's own state machine,
+		// which restores ITS saved state on the way out, and what is left is a
+		// replay whose clock still follows our seeks while the world no longer
+		// redraws for them - the frame counter climbs and the picture stays
+		// frozen on the new clip's first image. Nothing in the seek path can
+		// detect that, because from its point of view every seek lands exactly.
+		//
+		// So re-issue the pause and the seek for the clip we are now in, which
+		// is the same reasoning as the HUD flags further down: once something
+		// else has rewritten the state, setting it again at the point of use is
+		// the only ordering that holds.
+		if (s_modeWait)
+		{
+			logger::write("info",
+				"render: replay mode back to %d after %d frames (%s at frame %d)",
+				mode, s_modeWait,
+				s_step == Step::Audio ? "still recording" : "re-arming", s_frame);
+			s_modeWait = 0;
+
+			// The audio pass is a plain real-time playthrough - the engine has
+			// just moved itself to the next clip and there is nothing to re-seek.
+			// Everything below is frame-pass repair, and running it here paused
+			// playback and dropped the state machine into Settle, so the second
+			// clip came out as rendered frames instead of sound.
+			if (s_step == Step::Audio)
+			{
+				game::playbackSetSpeed(1.0f);
+				game::playbackPlay();
+				s_lastClock  = -1.0f;   // the new clip's clock has its own base
+				s_clockStillTick = 0;
+				return;
+			}
+
+			// Sliding is a playthrough too, so it needs the same treatment and
+			// none of the frame-pass repair below. Running that here would pause
+			// the clip and drop the state machine into Settle - which is exactly
+			// the bug the audio case above exists to avoid, and it would strand a
+			// sliding render on the first clip boundary.
+			//
+			// The engine restores ITS saved speed across a transition, so the
+			// slow motion has to be re-asserted rather than assumed.
+			if (s_step == Step::Slide)
+			{
+				// Same order as the slide start - see the note there.
+				game::playbackPlay();
+				game::playbackSetSpeed(s_slideSpeed);
+				s_lastClock  = -1.0f;   // the new clip's clock has its own base
+				s_clockStillTick = 0;
+				return;
+			}
+
+			// The rewind between the two passes goes through a transition too.
+			// Let its own waiter below decide when it has landed - there is no
+			// frame-pass state to repair yet.
+			if (s_step == Step::Rewind) return;
+
+			game::playbackPause();
+
+			const int at = game::clipIndex();
+
+			// A clip step we ASKED for, now landed. Put the project clock where
+			// we planned rather than where rebaseClip would guess.
+			if (s_wantClip >= 0 && at == s_wantClip) { landClip(); return; }
+
+			// Still waiting on one. The mode changed for some other reason -
+			// a stream-in, a transient - and this is not the arrival. Go back to
+			// waiting; deliberately WITHOUT resetting s_clipWait, or a mode that
+			// blips repeatedly would keep the guard from ever running out.
+			if (s_wantClip >= 0) { s_step = Step::ClipJump; return; }
+
+			if (s_clipN > 0 && at >= 0)
+			{
+				s_declineWait = 0;   // it answered; the streak is over
+
+				// The engine changed clip by itself. It does that whenever the
+				// clock reaches the end of a clip, which our own seeks can
+				// cause, so this is an ordinary way to arrive at the next clip
+				// and not an error - adopt it and carry on from there.
+				if (at > s_clipAt)
+				{
+					float lo = 0.0f, hi = 0.0f;
+					s_wantClip   = at;
+					s_wantClipAt = game::clipRangeAt(at, lo, hi) ? lo : 0.0f;
+					landClip();
+					return;
+				}
+
+				// Backwards is the preview wrapping to clip one, which is the
+				// end of the project: everything from here would be a second
+				// copy of footage already rendered. Note this is an INDEX
+				// comparison now. It used to compare clip time SPANS, and two
+				// clips cut from the same recording report the same span - so a
+				// perfectly ordinary project ended one clip in.
+				if (at < s_clipAt)
+				{
+					finish("finished - playback wrapped back to clip 1", true);
+					return;
+				}
+
+				// Same clip. Whatever moved the mode was not a transition, so
+				// there is nothing to rebase - re-seek where we were and carry
+				// on. Reading this as a wrap, which an earlier version of this
+				// block did, would have ended the render on any mode blip.
+				game::jumpProjectTo(seekTime(), 0);
+				s_wait = s_cfg.settleFrames;
+				s_step = Step::Settle;
+				return;
+			}
+
+			// Reaching here means clipIndex() DECLINED - it answered -1 while we
+			// do have a clip table. That is "ask again in a moment", not "this
+			// project has no clips", and the difference is a whole render.
+			//
+			// It used to fall straight through into the span-comparison path
+			// below, which is the heuristic the clip-table branch above exists to
+			// replace: two clips cut from the same recording report the same
+			// span, so it declares a loop and finishes the render as if complete.
+			// That is the multi-clip export dying part way into clip two.
+			//
+			// Depth of field is what made it reliable rather than occasional: a
+			// pass holds the game for tens of seconds per frame, so a transition
+			// is overwhelmingly likely to be observed inside one.
+			if (s_clipN > 0)
+			{
+				if (++s_declineWait > kBusyGuard)
+				{
+					finish("aborted - the clip table stopped answering", false);
+					return;
+				}
+				s_wait = s_cfg.settleFrames;
+				s_step = Step::Settle;
+				return;
+			}
+
+			// No clip table at all: the old behaviour, span comparison and all.
+			rebaseClip("changed");
+			if (s_looped)
+			{
+				finish("finished - project looped back to the first clip", true);
+				return;
+			}
+			game::jumpProjectTo(seekTime(), 0);
+			s_wait = s_cfg.settleFrames;
+			s_step = Step::Settle;   // abandon any ack we were waiting on
+			return;
+		}
+
+		// Between the passes: the audio is recorded and we have asked the editor
+		// to go back to clip one. Wait for it to land, then start the frame pass
+		// in this same playback.
+		//
+		// Deliberately above the heartbeat gate. The rewind needs nothing from
+		// the capture addon, and a render that could not get home because the
+		// addon happened to stall would be a bad trade.
+		if (s_step == Step::Rewind)
+		{
+			float lo = 0.0f, hi = 0.0f;
+			const bool haveClip = game::clipRangeAt(0, lo, hi);
+			const float clock   = game::addr_g_ReplayTimeMs
+			                    ? *(float*)game::addr_g_ReplayTimeMs : lo;
+
+			const bool home = haveClip && game::clipIndex() == 0 &&
+			                  !game::replayBusy() && clock <= lo + 250.0f;
+
+			if (!home)
+			{
+				// Re-ask periodically. The request is a single field the engine
+				// reads on its own schedule and clears when a transition starts,
+				// so one that arrives mid-transition is simply dropped.
+				if ((s_clipWait % 60) == 0) rewindToProjectStart();
+
+				if (++s_clipWait <= kBusyGuard) return;
+
+				logger::write("info",
+					"render: could not get back to clip 1 (clip %d, clock %.0f) - "
+					"press Export again to render the frames",
+					game::clipIndex(), clock);
+				s_step     = Step::Idle;
+				s_autoOpen = 120;
+				return;
+			}
+
+			// begin() insists on being entered from Idle, and startOpenEnded
+			// re-arms everything - including s_fromExport, so the editor still
+			// returns to its menus when the frames are done.
+			logger::write("info", "render: back at clip 1 - starting the frame pass");
+			s_step = Step::Idle;
+
+			const char* why = nullptr;
+			if (!startOpenEnded(&why))
+			{
+				logger::write("info",
+					"render: could not start the frame pass - %s (press Export again)",
+					why ? why : "?");
+				s_autoOpen = 120;
+			}
+			return;
+		}
+
+		// Audio pass, handled before the addon heartbeat below: recording sound
+		// needs nothing from the capture addon, so it must not be gated on one.
+		if (s_step == Step::Audio)
+		{
+			// Drop samples while the editor is loading. The frame pass holds
+			// through a clip transition and the video has no gap there, so
+			// recording those seconds would push everything after the first clip
+			// out of sync by however long the load took.
+			// s_audioStall in the gate as well as the end test: once the clock
+			// has stopped there is nothing left to record, and waiting out the
+			// full stall count before closing put an extra second and a half of
+			// dead air on the end of every take - which then became a second and
+			// a half of extra frames, since the frame count comes from this.
+			const bool clean = !game::replayBusy() && mode == s_startMode;
+			audioout::gate(clean && s_clockStillTick == 0);
+
+			// Follow the clip index, because on a multi-clip project it is the
+			// only reliable end there is.
+			//
+			// A full-project preview does not stop when it runs out of project -
+			// it WRAPS to clip one. The clock therefore never goes quiet, the
+			// stall test below never fires, and the pass records the project over
+			// and over until something else stops it: the audio pass simply did
+			// not end, so the frame pass never began. The index going backwards
+			// is that wrap, and it is unambiguous.
+			const int at = game::clipIndex();
+			bool clipChanged = false;
+			if (s_clipN > 0 && at >= 0)
+			{
+				if (at < s_clipAt)
+				{
+					finish("audio pass finished - project wrapped", true);
+					return;
+				}
+				clipChanged = at > s_clipAt;
+				if (clipChanged)
+					logger::write("info", "render: audio pass on clip %d/%d", at + 1, s_clipN);
+				s_clipAt = at;
+			}
+
+			// A project that instead PAUSES on the last clip ends with the clock
+			// going quiet while nothing is loading. Off the last clip that is a
+			// hitch rather than an ending, so it gets a much longer leash - long
+			// enough to ride out a stall, short enough that a genuinely wedged
+			// replay still lets go of the render eventually.
+			if (game::addr_g_ReplayTimeMs && clean)
+			{
+				const bool last    = s_clipN <= 0 || s_clipAt >= s_clipN - 1;
+				const int  limitMs = last ? kAudioStallMs : kAudioStallMs * 8;
+
+				const float now = *(float*)game::addr_g_ReplayTimeMs;
+
+				// The clock jumping BACKWARDS is the preview restarting. On a
+				// one-clip project that is the only form the wrap takes - the
+				// index cannot show it, because there is only ever clip one -
+				// and without this such a project records itself forever.
+				// Excluded when the clip just changed: a new clip's timeline
+				// legitimately starts lower than the last one ended.
+				if (!clipChanged && s_lastClock >= 0.0f && now < s_lastClock - 250.0f)
+				{
+					finish("audio pass finished - playback restarted", true);
+					return;
+				}
+
+				// "The clock has not moved for long enough" - measured in TIME, not
+				// in presents.
+				//
+				// It used to count presents, which made the threshold mean wildly
+				// different things on different machines: 90 presents is 1.5s at
+				// 60fps, 9s at 10fps, and 0.45s at 200fps. The last is the
+				// dangerous end - a brief hitch could be read as the end of the
+				// project and truncate the wav, which the frame pass then inherits
+				// as its length. A wall-clock window says the same thing on every
+				// machine.
+				const uint32_t tick = GetTickCount();
+				if (s_lastClock >= 0.0f && now <= s_lastClock + 0.001f)
+				{
+					if (s_clockStillTick == 0) s_clockStillTick = tick;
+
+					// Everything the end of an audio pass involves lives in
+					// finish(), including arming the frame pass. Closing the
+					// recorder here as well looked harmless and was not: it
+					// cleared s_audioPass first, so finish() took the frame-pass
+					// branch instead and the second pass was never queued.
+					if (tick - s_clockStillTick >= (uint32_t)limitMs)
+					{
+						finish(last ? "audio pass finished"
+						            : "audio pass finished - the clock stopped mid-project",
+						       true);
+						return;
+					}
+				}
+				else s_clockStillTick = 0;
+				s_lastClock = now;
+			}
+			return;
+		}
+
+		// One step per PRESENTED frame, not per call. Without this the whole
+		// state machine would spin through in a single frame and every capture
+		// would grab the same stale image.
+		const uint32_t beat = fxcapture::heartbeat();
+		if (beat == s_lastBeat) return;
+		if (beat == 0) { finish("aborted - capture addon went away", false); return; }
+		s_lastBeat = beat;
+
+		// ---------------------------------------------------------------------
+		//  SLIDING: the clip PLAYS; each output frame is advance-then-capture.
+		// ---------------------------------------------------------------------
+		//  Two phases per output frame, which is what makes the sample count exact
+		//  rather than emergent:
+		//
+		//    ADVANCE - let the clip run until the accumulated clock reaches this
+		//              frame's mark. Nothing is captured; these presents are the
+		//              cost of moving the world forward.
+		//    CAPTURE - take exactly RenderSamples consecutive presents, indices
+		//              0..N-1, and let the addon average them. The world keeps
+		//              simulating between them, which is the entire point of this
+		//              mode - particles step, and TAA/SSR/RT history stays warm.
+		//
+		//  The first version of this took "whatever presents happened to land in
+		//  the interval", so RenderSamples did nothing and the count moved with the
+		//  frame rate. Separating the two phases fixes that: the count is asked for
+		//  and delivered, and what varies instead is how much CLIP TIME those N
+		//  samples span - which is the shutter, and is what the speed now steers.
+		//
+		//  One present per sample. The addon captures inside its present handler
+		//  and acks there, and this runs from the camera update earlier in the same
+		//  frame, so posting sample j+1 on the next tick never races sample j. The
+		//  ack is still checked before posting - if the addon ever misses a present
+		//  we would otherwise skip an index and hand it a short average.
+		// ---------------------------------------------------------------------
+		if (s_step == Step::Slide)
+		{
+			if (s_slideFlush)
+			{
+				// Same hold: the frame is not written yet, so the clip must not
+				// move on to the next exposure without it.
+				if (!fxcapture::lastDone())
+				{
+					if (s_fxStep) game::fixedTimeHold(true);
+					return;
+				}
+				if (s_fxStep) game::fixedTimeHold(false);
+
+				if (videoout::active())
+				{
+					char done[MAX_PATH];
+					buildPath(done, sizeof(done));
+					videoout::pushFrame(done);
+				}
+				s_slideFlush   = false;
+				s_slideCapture = false;
+				s_slideSample  = 0;
+
+				// Shutter closed: one present covers the whole gap to the next
+				// frame, so the exposure lands exactly on the output grid. At a
+				// 360-degree shutter the gap is zero and this is a no-op.
+				if (s_fxStep && s_fxGapMs > 0.0f) game::fixedTimeSetStep(s_fxGapMs);
+
+				// The speed CONTROLLER below is what the stepper replaces - not the
+				// frame bookkeeping that follows it.
+				//
+				// This was a bare `return`, which also skipped ++s_frame at the end of
+				// the block. Video mode hid it: pushFrame() runs above this, so ffmpeg
+				// still received every frame and the output looked correct - while
+				// s_frame sat at 0, buildPath() named every file frame_000000.png, and
+				// an image-sequence render overwrote one file for its whole length.
+				// Guard the steering only.
+				if (!s_fxStep)
+				{
+				// Steer on POSITION, not on rate.
+				//
+				// The obvious controller here asks "did N samples span the shutter"
+				// and nudges the speed until they do. That regulates the exposure
+				// LENGTH and says nothing about where on the output timeline the
+				// exposure sat, and the difference is what decides whether the
+				// finished video plays at a constant speed.
+				//
+				// A player assumes frame f covers exactly f*dt onwards. Nothing in a
+				// rate controller anchors it there, and it is blind by construction: a
+				// clock running at exactly the right RATE but a few milliseconds behind
+				// measures its own span as perfect and corrects nothing, so the offset
+				// stays forever. Cruise control holds the speed and has no opinion
+				// about being three miles from where you meant to be.
+				//
+				// The advance phase below looks like it already covers that - it waits
+				// for the absolute grid, `s_slideTime >= s_frame * s_dt`, so an error
+				// cannot compound. True for a short shutter, and FALSE at the default
+				// 360 degrees, which is the case that matters: there the wanted span IS
+				// the frame interval, so no advance slack is left to absorb anything.
+				// The test only enforces "not earlier than" - it can wait, it cannot
+				// rewind - so an exposure that ran long pushes the next mark late by the
+				// overshoot and every later frame inherits it. Hitches only ever add.
+				// A one-way ratchet, and exactly the "the video drifts in time" symptom.
+				//
+				// So compare against where the exposure SHOULD have closed and fold the
+				// difference into the next cycle. Absolute, so it does not matter how
+				// the error arose, and self-correcting rather than merely
+				// non-compounding.
+				// What ONE exposure could span with the throttle wide open.
+				//
+				// s_slideStep is clip-ms per present at the CURRENT speed, so
+				// dividing it out gives the per-present step at 1.0x - the fastest
+				// the clip can legally move. Multiply by the sample count and that
+				// is the widest shutter this mode can actually deliver here.
+				//
+				// Needed because the controller below was written assuming the
+				// requested exposure is always reachable. It is not: covering
+				// dt*shutter across N presents needs speed = dt*shutter/(N*step),
+				// which at a low sample count and a wide shutter exceeds 1.0 and
+				// cannot be had. Asking anyway made the loop oscillate between the
+				// speed floor and ceiling - measured swinging 0.04x..0.84x at two
+				// samples, which is both wrong and glacial.
+				const double perPresentFull = (s_slideSpeed > 0.0f)
+					? s_slideStep / (double)s_slideSpeed : s_slideStep;
+
+				if (s_cfg.samples > 1)
+				{
+					const double want     = (double)s_dt * (double)s_cfg.shutter;
+					const double reach    = perPresentFull * (double)s_cfg.samples;
+					const double consumed = s_slideTime - s_slideMark;
+
+					// HOW LATE THIS FRAME'S EXPOSURE OPENED. That is the whole pacing
+					// error, and it is the only one worth correcting.
+					//
+					// This used to be `s_slideTime - (f*dt + want)` - where the
+					// exposure ENDED against where a full-length one would have. That
+					// conflates two unrelated things: which slot the frame occupies
+					// (f*dt, a pacing fact) and how long its exposure ran (a blur
+					// setting). They coincide only at a 360-degree shutter that the
+					// clip can actually keep up with.
+					//
+					// When it cannot - two samples at 360 degrees needs the clip at 2x
+					// and 1.0x is the ceiling - the exposure is structurally shorter
+					// than `want` forever, so that expression reported a huge standing
+					// error that no amount of speed could remove. The loop answered by
+					// slamming the speed to the floor, the advance phase then crawled,
+					// the absolute grid eventually dragged it back, and it repeated:
+					// clip time surging and stalling against a steady frame count,
+					// which is exactly a SPEED-RAMPED output.
+					//
+					// Measuring the OPEN instead is immune to all of that. Never
+					// negative - the advance waits for the absolute mark, so a frame
+					// can open late but never early - and unaffected by an exposure
+					// that had to be cut short.
+					const double lateness = s_slideMark - (double)s_frame * (double)s_dt;
+
+					// Half the drift, not all of it. One frame's clock reading is
+					// quantised by the present that carried it, so this is a noisy
+					// measurement; correcting it in full chases the noise and rings.
+					// Opened late: shorten the next exposure so the advance reaches the
+					// following mark sooner and the lateness is paid back. Opened on
+					// time: leave it alone.
+					double target = want - lateness * kSlideDriftGain;
+
+					// Asymmetric on purpose. The two directions are not equivalent:
+					// running BEHIND is absorbed by the advance wait and costs nothing,
+					// while running AHEAD cannot be undone without a seek - and a seek is
+					// the zero-delta frame this whole mode exists to avoid. So the loop
+					// may slow almost to a stop to let the grid catch up, and may only
+					// hurry back gently. It settles fractionally short, the harmless side.
+					const double lo = want * kSlideTargetLo;
+					const double hi = want * kSlideTargetHi;
+					if (target < lo) target = lo;
+					if (target > hi) target = hi;
+
+					// Never demand more than the mode can reach. Without this the
+					// ratio below is chasing a span the clip physically cannot
+					// cover, so it pins the speed at the ceiling, overshoots the
+					// grid, and the drift term then slams it to the floor - the
+					// oscillation, in one line.
+					if (reach > 0.0 && target > reach) target = reach;
+
+					// Proportional, and it replaces the old two-regime nudge outright.
+					// That version corrected nothing at all inside a +/-15% band, which is
+					// precisely where a standing offset lives, and needed a separate fast
+					// path for large errors because a fixed 10% step took fourteen frames
+					// to walk back from a bad start. One clamped ratio does both jobs.
+					if (consumed > 0.0)
+					{
+						double k = target / consumed;
+						if (k < 0.1) k = 0.1;
+						if (k > 4.0) k = 4.0;
+						s_slideSpeed = (float)((double)s_slideSpeed * k);
+					}
+
+					// Same floor the calibration uses. Without it the controller can
+					// walk the speed back under the clock's resolution between frames
+					// and stall a render that had already started cleanly.
+					slideFloor(s_slideSpeed);
+					if (s_slideSpeed > 1.0f)   s_slideSpeed = 1.0f;
+					game::playbackSetSpeed(s_slideSpeed);
+
+					const int shown = (int)(s_slideSpeed * 10000.0f);
+					if (shown != s_slideLogged)
+					{
+						s_slideLogged = shown;
+						logger::write("info",
+							"render: sliding - %d sample(s) spanned %.1fms of a %.1fms "
+							"shutter, opened %+.1fms late; speed now %.4gx",
+							s_cfg.samples, consumed, want, lateness, s_slideSpeed);
+					}
+
+					// Say it ONCE when the requested shutter is out of reach.
+					// Silently delivering a shorter exposure than asked for is the
+					// kind of thing someone only discovers by comparing two
+					// renders, and the remedy is a setting they already have.
+					if (!s_slideToldReach && reach > 0.0 && want > reach * 1.15)
+					{
+						s_slideToldReach = true;
+						logger::write("info",
+							"render: sliding cannot reach a %.1fms shutter with %d sample(s) "
+							"- the clip would have to run at %.2gx and 1.0x is the limit, so "
+							"the exposure tops out near %.1fms (about %.0f degrees). Raise "
+							"Motion Blur, or use Walking, which places samples by seeking "
+							"and has no such limit.",
+							want, s_cfg.samples, want / (reach > 0.0 ? reach : 1.0),
+							reach, 360.0 * reach / (double)s_dt);
+					}
+				}
+				else
+				{
+					// ONE SAMPLE: an instant, not an exposure.
+					//
+					// There is no span to regulate, so the old code simply skipped
+					// the controller - and with it the correction that the 0.35x
+					// calibration bias depends on, leaving the clip crawling at a
+					// speed nothing would ever raise. What still matters at one
+					// sample is WHERE the instant lands, so steer the per-present
+					// step instead of the exposure: hold it to a fraction of the
+					// frame interval and the grid stays tight while the clip runs
+					// as fast as that allows.
+					const double wantStep = (double)s_dt * kSlideStep1;
+					if (s_slideStep > 0.0)
+					{
+						double k = wantStep / s_slideStep;
+						if (k < 0.1) k = 0.1;
+						if (k > 4.0) k = 4.0;
+
+						// Toward the ratio, not all the way to it - see
+						// kSlideStepGain.
+						k = 1.0 + (k - 1.0) * kSlideStepGain;
+						s_slideSpeed = (float)((double)s_slideSpeed * k);
+					}
+
+					// Same floor the calibration uses. Without it the controller can
+					// walk the speed back under the clock's resolution between frames
+					// and stall a render that had already started cleanly.
+					slideFloor(s_slideSpeed);
+					if (s_slideSpeed > 1.0f)   s_slideSpeed = 1.0f;
+					game::playbackSetSpeed(s_slideSpeed);
+
+					const int shown = (int)(s_slideSpeed * 10000.0f);
+					if (shown != s_slideLogged)
+					{
+						s_slideLogged = shown;
+						logger::write("info",
+							"render: sliding - no blur, one present covers %.1fms of a "
+							"%.1fms frame; speed now %.4gx",
+							s_slideStep, (double)s_dt, s_slideSpeed);
+					}
+				}
+
+				}   // end of the speed controller
+
+				// The lens, per frame, as the add-on actually received it.
+				//
+				// The delta is not a constant: it is interpolated between markers, so a
+				// focus pull only shows up frame by frame. And because it is a
+				// DISPARITY it means nothing without the aperture it was measured
+				// against - the pair has to be logged together or neither number can
+				// be checked afterwards.
+				if (s_cfg.dof)
+					logger::write("info",
+						"render: frame %d lens - aperture %.4f, focus delta %.5f, %s",
+						s_frame, s_cfg.dofBokehSize, dofFocusDeltaNow(),
+						dofAutofocusNow() ? "autofocus" : "manual");
+
+				if (++s_frame >= s_frames) { finish("finished", true); return; }
+
+				reportProgress();
+			}
+
+			if (!game::addr_g_ReplayTimeMs) { finish("aborted - no replay clock", false); return; }
+
+			// Follow the engine across clips, and stop when it wraps - the same
+			// rule the audio pass uses, because a full-project preview does not
+			// stop at the end, it returns to clip one.
+			const int at = game::clipIndex();
+			bool clipChanged = false;
+			if (s_clipN > 0 && at >= 0)
+			{
+				if (at < s_clipAt) { finish("finished - playback wrapped back to clip 1", true); return; }
+				clipChanged = at > s_clipAt;
+				if (clipChanged)
+					logger::write("info", "render: sliding onto clip %d/%d at frame %d",
+						at + 1, s_clipN, s_frame);
+				s_clipAt = at;
+			}
+
+			// Nothing usable is on screen during a load, and the clock is not
+			// moving either, so contribute neither a sample nor any time.
+			//
+			// The stall timer is reset too, and that is not tidying. It holds the
+			// TIMESTAMP stillness began at, and this path skips the test that
+			// would clear it - so a load left a mark from seconds ago, and the
+			// next still frame subtracted against it and blew straight past the
+			// limit. Below is explicit that a clock stopping "while nothing is
+			// loading" is the end of the project; time spent loading is therefore
+			// not time the clock was stopped, and must not count towards it.
+			if (game::replayBusy() || s_spinnerSeen)
+			{
+				s_spinnerSeen    = false;
+				s_lastClock      = -1.0f;
+				s_clockStillTick = 0;
+				return;
+			}
+
+			// Wall-clock between presents. QueryPerformanceCounter, not
+			// GetTickCount: presents here are ~7ms apart and GetTickCount's
+			// resolution is ~15ms, which would quantise the answer into
+			// uselessness.
+			{
+				LARGE_INTEGER qpc, freq;
+				if (QueryPerformanceCounter(&qpc) && QueryPerformanceFrequency(&freq) &&
+				    freq.QuadPart > 0)
+				{
+					if (s_slideLastQpc != 0)
+					{
+						const double ms = 1000.0 * (double)(qpc.QuadPart - s_slideLastQpc)
+						                / (double)freq.QuadPart;
+						// Reject a hitch or a breakpoint; keep the ordinary spread.
+						if (ms > 0.0 && ms < 500.0)
+							s_slideRealStep = (s_slideRealStep <= 0.0)
+								? ms : s_slideRealStep * 0.8 + ms * 0.2;
+					}
+					s_slideLastQpc = qpc.QuadPart;
+				}
+			}
+
+			const float clock = *(float*)game::addr_g_ReplayTimeMs;
+
+			// Accumulate clip time, refusing the deltas that are not playback:
+			// negative is a new clip or a restart, and an implausibly large jump is
+			// a hitch or a seek. Crediting either slides the output timeline
+			// against the picture.
+			if (s_lastClock >= 0.0f && !clipChanged)
+			{
+				const float delta = clock - s_lastClock;
+				if (delta > 0.0f && delta < s_dt * 4.0f)
+				{
+					// Credit the advance in OUTPUT time, not authored time.
+					//
+					// This is where slow motion lives for sliding capture. Walking
+					// seeks through sampleTime() and picks up the dilation there;
+					// sliding never seeks - it lets the clip play and watches the
+					// clock - so without this the frame grid below compares
+					// authored ms against output ms and the two run 1:1. A 50%
+					// section then rendered at full speed and ran out of clip
+					// early: 60 frames delivered against 87 asked for, 2.0s of
+					// video against 2.8s of audio.
+					//
+					// Converting BOTH endpoints and subtracting is exact, and
+					// avoids differentiating a piecewise curve across a speed
+					// change where the rate is discontinuous. The per-clip base the
+					// conversion adds cancels in the subtraction.
+					//
+					// The plausibility guard above stays on the RAW delta on
+					// purpose: at 5% the dilated step is twenty times larger and
+					// would trip a bound meant to catch seeks and hitches.
+					double step = delta;
+					if (Config::get().renderMarkerSpeed)
+					{
+						const float a = game::nonDilatedToDilatedMs(s_lastClock);
+						const float b = game::nonDilatedToDilatedMs(clock);
+						if (b > a) step = (double)(b - a);
+					}
+
+					s_slideTime += step;
+					// How much OUTPUT time one present covers, smoothed. This is the
+					// whole measurement AUTO needs: it already folds in the present
+					// rate and the current speed, so no assumption about either.
+					//
+					// Dilated for the same reason as the accumulator: the shutter is
+					// a fraction of an OUTPUT frame, so at 50% a 360-degree exposure
+					// must span half as much authored time, not the same amount.
+					s_slideStep = (s_slideStep <= 0.0) ? step : s_slideStep * 0.8 + step * 0.2;
+				}
+
+				// A clock that stops while nothing is loading is the project having
+				// ended on its last clip.
+				//
+				// Timed, not counted, for the same reason as the audio pass: as a
+				// present count this ended the render after 0.45s of stillness on a
+				// fast machine, which is well inside an ordinary hitch.
+				if (delta <= 0.0f)
+				{
+					// ...but it CANNOT have ended before frame 0. Nothing has been
+					// exposed yet, so "the project ended" is not an available
+					// explanation for a still clock here - a slow seed speed is.
+					// The calibration below can seed 0.001x, and at that speed the
+					// engine's own clock quantisation swallows the step entirely:
+					// every present reads delta 0, the 1.5s timer expires, and a
+					// render that was about to correct itself reports "finished"
+					// at 0 of 1891 frames instead.
+					//
+					// So before the first frame this is a stall, not an ending, and
+					// it gets the long bound the audio pass uses for the same
+					// reason. The controller has thousands of presents to converge
+					// inside that.
+					const uint32_t lim = (s_frame == 0) ? (uint32_t)kAudioStallMs * 8
+					                                    : (uint32_t)kAudioStallMs;
+					const uint32_t tick = GetTickCount();
+					if (s_clockStillTick == 0) s_clockStillTick = tick;
+					if (tick - s_clockStillTick >= lim)
+					{
+						finish(s_frame == 0 ? "the clip clock never advanced"
+						                    : "finished - the clock stopped", true);
+						return;
+					}
+				}
+				else s_clockStillTick = 0;
+			}
+			s_lastClock = clock;
+
+			// --- WARM-UP ------------------------------------------------------
+			//
+			// Measure before exposing anything. Frame 0's mark is zero, so without
+			// this the capture begins on the first present and the seed speed goes
+			// straight into the shutter - which is how a 33ms exposure came out
+			// spanning 1373ms of clip.
+			if (!s_slideCalib)
+			{
+				++s_slideWarm;
+
+				// Throw away the first half of the measurement.
+				//
+				// playbackSetSpeed does not take effect on the present that
+				// issues it, so the earliest deltas are still at whatever speed
+				// the clip was running at before - which for the frame pass is
+				// 1.0x. Averaging those in reads the OLD speed: the log showed
+				// "one present covers 9.213ms of clip at 0.005x", implying 1.8
+				// seconds per present, when the true figure was ~0.4ms. The
+				// calibration came out ~23x too slow and the controller needed
+				// five frames to climb back - five visibly under-blurred frames,
+				// in the output, at the head of every render.
+				//
+				// Resetting the average here means only deltas measured at the
+				// speed we actually set reach it.
+				if (s_slideWarm == kSlideWarm / 2)
+				{
+					s_slideStep   = 0.0;
+					s_slideWarmT0 = GetTickCount();
+					s_slideWarmN0 = s_slideWarm;
+				}
+
+				if (s_slideWarm < kSlideWarm || s_slideStep <= 0.0) return;
+
+				// DOES THE MEASUREMENT DESCRIBE THE SPEED WE SET?
+				//
+				// Dropping the first half assumes the speed has landed by then. It
+				// has not when the warm-up is slow enough - one report spent 2.5s
+				// on these 12 presents while streaming, and the kept half still
+				// read normal-speed playback: 39.8ms of clip per present at a
+				// nominal 0.005x, i.e. one present every 8 seconds. Committing that
+				// seeds the floor, 0.001x, which is slow enough that the clock
+				// stops moving at all.
+				//
+				// The measurement is checkable rather than trusted. Clip-ms per
+				// present over real-ms per present IS the speed being played, so
+				// if that disagrees with the speed we asked for, the request has
+				// not taken effect and there is nothing to calibrate from yet.
+				// Wide threshold because a fast-motion marker legitimately inflates
+				// the ratio - the failure this catches is off by 19x.
+				const uint32_t warmNow = GetTickCount();
+				// From where THIS window started counting, not from the original
+				// half-way mark - a re-measure resets the clock, and pairing a
+				// fresh clock with a stale present count reads far too fast.
+				const int      warmN   = s_slideWarm - s_slideWarmN0;
+				if (warmN > 0 && warmNow > s_slideWarmT0)
+				{
+					s_slidePerPresent = (double)(warmNow - s_slideWarmT0) / (double)warmN;
+					const double playing = s_slideStep / s_slidePerPresent;
+					s_slideStepOk = !(playing > (double)s_slideSpeed * 4.0);
+					if (!s_slideStepOk && s_slideWarm < kSlideWarm * 8)
+					{
+						// Measure again. s_slideWarm keeps climbing, so this is
+						// bounded by the cap above and then commits regardless -
+						// a poor calibration is recoverable, a hang is not.
+						if (!s_slideToldRemeasure)
+						{
+							s_slideToldRemeasure = true;
+							logger::write("info",
+								"render: sliding - the clip is still playing at %.4gx "
+								"after asking for %.4gx, so there is nothing to "
+								"calibrate from yet. Measuring again.",
+								playing, (double)s_slideSpeed);
+						}
+						s_slideStep   = 0.0;
+						s_slideWarmT0 = warmNow;
+						s_slideWarmN0 = s_slideWarm;
+						return;
+					}
+				}
+
+				s_slideCalib = true;
+
+				// -----------------------------------------------------------------
+				// RAISE THE SAMPLE COUNT TO WHAT SLIDING CAN ACTUALLY PACE.
+				//
+				// At a wide shutter the exposure IS the frame - there is no advance
+				// phase left to absorb anything - so N presents have to cover
+				// dt*shutter exactly, at a speed of at most 1.0x:
+				//
+				//     N >= dt * shutter / (clip ms one present covers at 1.0x)
+				//       =  shutter * presentFPS / outputFPS
+				//
+				// Below that it is not a tuning problem, it is arithmetic: two
+				// presents cannot span 33.3ms unless the clip runs at 2x, and 1.0x
+				// is the ceiling. The controller can then only choose which way to
+				// be wrong, and what it chose was to slam the speed to the floor,
+				// let the absolute grid drag it back, and repeat - clip time surging
+				// and stalling against a steady frame count, i.e. a SPEED-RAMPED
+				// output. Measured opening 130ms late on a six-frame cycle.
+				//
+				// So raise it. This is not a compromise: more samples at the same
+				// shutter is the SAME exposure, sampled more finely - the user gets
+				// the 360 degrees they asked for, correctly paced, instead of an
+				// effective 183 and a ramp. It costs presents, which is the thing
+				// sliding spends anyway.
+				//
+				// MEASURED, not tabled. The figure depends on the present rate,
+				// which is the machine and the scene: 144fps into 30fps needs 5,
+				// the same box into 60fps needs 3, a 45fps laptop needs 2. A
+				// hardcoded floor would be wrong in both directions.
+				if (s_cfg.samples > 1 && s_slideRealStep > 0.0)
+				{
+					// At 1.0x, clip time and wall-clock advance together - so the
+					// real interval between presents IS the most clip time one
+					// present can cover. Measured, and immune to the speed not
+					// having taken effect yet.
+					const double stepAtFull = s_slideRealStep;
+					const double needSpan   = (double)s_dt * (double)s_cfg.shutter;
+
+					// +1 of headroom: landing exactly on 1.0x leaves the controller
+					// no room to correct upwards when a present runs long.
+					int need = (int)ceil(needSpan / stepAtFull) + 1;
+					if (need > kSlideMaxAutoSamples) need = kSlideMaxAutoSamples;
+
+					if (need > s_cfg.samples)
+					{
+						logger::write("info",
+							"render: sliding needs at least %d sample(s) here and %d were "
+							"set - raising it. Presents are %.2fms apart, so at 1.0x that "
+							"is the most clip time one can cover; %d could only span "
+							"%.1fms of a %.1fms shutter and the clip would have to run at "
+							"%.2gx, with 1.0x the limit. Fewer samples than this cannot be "
+							"PACED, not merely under-blurred - it comes out speed-ramped. "
+							"Walking has no such floor.",
+							need, s_cfg.samples, stepAtFull, s_cfg.samples,
+							stepAtFull * s_cfg.samples, needSpan,
+							needSpan / (stepAtFull * s_cfg.samples));
+						s_cfg.samples = need;
+					}
+				}
+
+				// At one sample the target is a per-present STEP, not an exposure,
+				// and it has to be the same number the controller steers to or the
+				// two pull against each other for the first few frames.
+				const int    n    = s_cfg.samples < 1 ? 1 : s_cfg.samples;
+				const double want = (n > 1) ? (double)s_dt * (double)s_cfg.shutter
+				                            : (double)s_dt * kSlideStep1;
+				const double have = s_slideStep * (double)n;
+
+				// TWO WAYS TO GET THERE, and the ratio is only the better one.
+				//
+				// The ratio (speed x want / step) folds in whatever speed the clip is
+				// ACTUALLY playing at, which is why it is preferred - but it is only
+				// meaningful if `step` was measured at the speed we asked for. When the
+				// request never lands, every measurement reads 1.0x and the ratio comes
+				// out ~200x too slow: a report seeded 0.001x, i.e. 33 SECONDS of real
+				// time per output frame. The controller cannot rescue that - it only
+				// corrects BETWEEN frames, so the escape hatch sits behind the very
+				// 33-second wall it exists to escape.
+				//
+				// So when the measurement is rejected, derive the seed from what holds
+				// whether or not the speed took: we want want/n of clip per present,
+				// and a present really takes s_slidePerPresent ms. That ratio IS the
+				// speed, with no dependence on the current one.
+				//
+				// Approximate on purpose - want is DILATED ms and perPresent is REAL,
+				// so a speed marker skews it. It only runs when the alternative is
+				// already wrong by orders of magnitude, and inside 2x is all the
+				// controller needs to converge from.
+				const bool useRatio = s_slideStepOk && have > 0.0;
+				if (useRatio || s_slidePerPresent > 0.0)
+				{
+					float ns = useRatio
+						? (float)((double)s_slideSpeed * want / have) * kSlideCalibBias
+						: (float)((want / (double)n) / s_slidePerPresent) * kSlideCalibBias;
+					// Raise it to what the clock can actually step, and say so - the
+					// exposure is then longer than the shutter asked for, which is a
+					// thing the user can act on (fewer samples, or a wider shutter).
+					if (s_slidePerPresent > 0.0)
+					{
+						const float floorSpeed =
+							(float)(kMinClipStepMs / s_slidePerPresent);
+						if (ns < floorSpeed)
+						{
+							logger::write("info",
+								"render: %d sample(s) over a %.1fms shutter would step the clip "
+								"%.3fms per present, under the %.2fms the replay clock resolves - "
+								"so the speed is held at %.4gx and the exposure will be about %.0f%% "
+								"longer than asked. Lower RenderSamples or raise RenderShutter to "
+								"avoid it.",
+								n, want, (double)ns * s_slidePerPresent, kMinClipStepMs, floorSpeed,
+								((double)floorSpeed / (double)ns - 1.0) * 100.0);
+							ns = floorSpeed;
+						}
+					}
+					if (ns < 0.001f) ns = 0.001f;
+					if (ns > 1.0f)   ns = 1.0f;
+					logger::write("info",
+						"render: sliding AUTO - %s. One present covers %.3fms of clip at "
+						"%.4gx (%.1fms real), so %d sample(s) start at %.4gx for a %.1fms shutter",
+						useRatio ? "measured"
+							: "the speed request never landed, so this is paced off the present rate",
+						s_slideStep, s_slideSpeed, s_slidePerPresent, n, ns, want);
+					s_slideSpeed  = ns;
+					s_slideLogged = (int)(ns * 10000.0f);
+					game::playbackSetSpeed(s_slideSpeed);
+				}
+
+				// The warm-up was pre-roll, not output time - so rewind it.
+				//
+				// It used to only rebase the clock and let frame 0 start from
+				// wherever the measurement had left the playhead. That silently ate
+				// the HEAD of the clip: the warm-up plays at the seed speed while it
+				// measures, and everything it consumed was simply never rendered.
+				// The frame count comes from the whole clip, so the render then ran
+				// off the end early and the shortfall looked like a stopping bug.
+				//
+				// Measured on a 1154 ms clip: 22 frames of 30, video 0.92s against
+				// 1.18s of audio, and the first ~237 ms of the action missing. It
+				// scales with clip length, which is why it hid for so long - on a
+				// 30-second shot the same 237 ms is a rounding error.
+				//
+				// One seek, and only here: the playhead goes back to where frame 0
+				// belongs before anything is exposed. Sliding avoids seeking DURING
+				// the exposure, which this is not - it is the same seek begin()
+				// already does, repeated now that the speed is known.
+				s_slideTime      = 0.0;
+				s_lastClock      = -1.0f;   // the next delta belongs to the new speed
+				s_clockStillTick = 0;       // and so does the stall timer
+
+				game::jumpProjectTo(seekTime(), 0);
+				return;
+			}
+
+			// --- ADVANCE ------------------------------------------------------
+			if (!s_slideCapture)
+			{
+				if (s_slideTime < (double)s_frame * (double)s_dt) return;
+				s_slideCapture = true;
+				s_slideSample  = 0;
+				s_slideMark    = s_slideTime;   // where this frame's exposure opened
+				// Shutter open: back to the sub-sample step.
+				if (s_fxStep) game::fixedTimeSetStep(s_fxSampleMs);
+			}
+
+			// --- CAPTURE ------------------------------------------------------
+			//
+			// HOLD THE CLIP, do not just skip. The engine steps on every Process()
+			// whether or not we captured, so returning here without holding would
+			// advance past a sub-sample that never made it into the accumulator -
+			// an exposure quietly short by one sample, per stutter.
+			if (!fxcapture::lastDone())
+			{
+				if (s_fxStep) game::fixedTimeHold(true);
+				return;
+			}
+			if (s_fxStep) game::fixedTimeHold(false);
+
+			const int want = s_cfg.samples < 1 ? 1 : s_cfg.samples;
+
+			char path[MAX_PATH];
+			buildPath(path, sizeof(path));
+			fxcapture::requestSample(path, want, s_slideSample);
+
+			if (++s_slideSample >= want) s_slideFlush = true;
+			return;
+		}
+
+		switch (s_step)
+		{
+		case Step::Settle:
+		{
+			if (--s_wait > 0) return;
+
+			// LOADING IS CHECKED FIRST, and that ordering is the whole fix for
+			// multi-clip renders. A seek across a clip boundary sends the editor
+			// into a load, during which the clock legitimately stops moving. The
+			// end-of-timeline test below cannot tell that apart from running out
+			// of project, so if it runs first it declares the render finished at
+			// the first clip boundary and returns to the menu - which is exactly
+			// what happened. A clock that is not advancing because a clip is
+			// loading is not the end of anything.
+			if (game::replayBusy() || s_spinnerSeen)
+			{
+				s_spinnerSeen = false;
+				if (++s_busyWait > kBusyGuard)
+				{
+					finish("aborted - stuck loading", false);
+					return;
+				}
+				// The clock is meaningless mid-load; do not let this count
+				// towards the end-of-timeline decision.
+				s_shortRuns = 0;
+				s_wait = s_cfg.settleFrames; // resettle once the clip is back
+				return;
+			}
+			s_busyWait = 0;
+
+			// ---------------------------------------------------------------
+			// Off the end of the clip on screen: step to the next one, or stop.
+			//
+			// This is the multi-clip pump, and the thing that was missing. A
+			// seek CLAMPS to the clip it is already in, so once the project
+			// clock runs past this clip's end every seek from here lands on the
+			// same last image - which is what "it renders one clip" actually
+			// was: clip one, correct, then that clip's final frame repeated for
+			// however many frames were left in the count.
+			//
+			// The old code waited for the ENGINE to change clip. It does do that
+			// when the clock reaches a clip end, and the handler above still
+			// takes it when it happens - but it is not something to depend on
+			// while paused, and there is no reason to wait for it when the clip
+			// list is right there. Asking outright also turns the end of the
+			// project into a fact - there is no clip after this one - instead of
+			// the ten-strikes-and-assume below.
+			// ---------------------------------------------------------------
+			// Whether the clip table answered THIS time, not merely whether it
+			// answered at the start.
+			//
+			// These accessors go through the playback controller and can decline
+			// - they need the replay mode to be right, and a render spends time
+			// in transitions where it is not. Keyed on s_clipN alone, a decline
+			// took the clip branch, found nothing to do, and SKIPPED the
+			// end-of-timeline fallback below because that was an `else if`. On an
+			// open-ended render (s_frames = INT_MAX) nothing else stops it, so
+			// the render simply never ended.
+			bool clipEndKnown = false;
+			if (s_clipN > 0)
+			{
+				float lo = 0.0f, hi = 0.0f;
+
+				// Half a millisecond of tolerance: seekTime() lands exactly on
+				// hi at the last frame of a clip whose length divides evenly,
+				// and that frame is this clip's, not the next one's.
+				if (game::clipRange(lo, hi))
+				{
+					clipEndKnown = true;
+					if (seekTime() > hi + 0.5f)
+					{
+						if (s_clipAt + 1 < s_clipN) { advanceClip(hi); return; }
+						finish("finished - end of the last clip", true);
+						return;
+					}
+				}
+			}
+
+			// End of the project, for open-ended renders with no clip table -
+			// and for the clip-aware ones whenever the table declined above.
+			//
+			// Both sides are now in the CLIP's own time - seekTime() is what we
+			// actually asked the engine for, and the clock reports the same
+			// space - so this is a straight "did the seek land" test with no
+			// offset bookkeeping. The clip-restart guesswork that used to live
+			// here existed only because project time was being compared against
+			// clip time, and re-basing on transition removed the mismatch it was
+			// trying to paper over.
+			if (!clipEndKnown && s_openEnded && game::addr_g_ReplayTimeMs)
+			{
+				const float want = seekTime();
+				const float have = *(float*)game::addr_g_ReplayTimeMs;
+				s_lastClock = have;
+
+				if (want - have > s_dt * 1.5f)
+				{
+					logger::write("info",
+						"render: seek fell short at frame %d - want %.1f, clock %.1f, lag %.1f [strike %d]",
+						s_frame, want, have, want - have, s_shortRuns + 1);
+
+					// Several strikes, not two: the cost is asymmetric. Too eager
+					// ends a long render early and silently; too patient wastes a
+					// few seconds of seeks at the real end. Running off the end of
+					// the LAST clip lands here, which is correct - running off the
+					// end of any other clip makes the editor change clip first,
+					// and the re-base resets this.
+					if (++s_shortRuns >= 10) { finish("finished - reached the end", true); return; }
+					s_wait = s_cfg.settleFrames;
+					return;
+				}
+				s_shortRuns = 0;
+			}
+
+			// Depth-of-field mode: the add-on accumulates this frame across the
+			// aperture, and we capture what it leaves on screen.
+			//
+			// Asked for HERE rather than earlier because the seek and the settle
+			// above have to have landed first - the pass anchors its shutter on
+			// the clock as it finds it, so starting one mid-seek would sweep the
+			// aperture around the wrong instant.
+			if (s_cfg.dof)
+			{
+				if (Config::get().splineDebugLog)
+					logger::write("info",
+						"dof-seq: frame %d requesting pass, clock %.1f (settle done)",
+						s_frame, clockNow());
+				s_dofClockAtStart = clockNow();
+				s_dofSeq     = fxcapture::dofRequest(dofShutterMs(), s_cfg.dofBokehSize, s_cfg.dofQuality,
+						dofAutofocusNow(), s_cfg.dofFocusX, s_cfg.dofFocusY, dofFocusDeltaNow(),
+						slidingDof());
+				s_dofStartMs = GetTickCount();
+				if (s_dofSeq == 0)
+				{
+					finish("aborted - capture channel lost", false);
+					return;
+				}
+				s_step = Step::DofPass;
+				return;
+			}
+
+			char path[MAX_PATH];
+			buildPath(path, sizeof(path));
+			if (!fxcapture::requestSample(path, s_cfg.samples, s_sample))
+			{
+				finish("aborted - capture channel lost", false);
+				return;
+			}
+			s_guard = 0;
+			s_step  = Step::Ack;
+			return;
+		}
+
+		case Step::DofPass:
+		{
+			// LOADING FIRST, for the same reason Step::Settle checks it first.
+			//
+			// This branch had no such test, and it is the one that needed it
+			// most: a pass runs for tens of seconds, so a clip transition landing
+			// inside one is the normal case on a multi-clip project rather than
+			// the rare one. The add-on cannot finish a sweep across a load - the
+			// frames it is accumulating are a loading screen - and kDofGuardMs
+			// would eventually call that "the pass never finished".
+			//
+			// The watchdog is rebased rather than merely paused: time spent
+			// loading is not time the pass spent failing, and a slow stream-in
+			// should not spend the budget that exists to catch a wedged add-on.
+			if (game::replayBusy() || s_spinnerSeen)
+			{
+				s_spinnerSeen = false;
+				if (++s_busyWait > kBusyGuard)
+				{
+					finish("aborted - stuck loading during a depth-of-field pass", false);
+					return;
+				}
+				s_dofStartMs = GetTickCount();
+				return;
+			}
+			s_busyWait = 0;
+
+			// SLIDING WITH THE LENS: advance the clock between aperture samples.
+			//
+			// The add-on takes one sample per present and we get one pump per
+			// present, so stepping here puts every sample at both a different point
+			// on the lens and a different instant - which is what a real lens and a
+			// real shutter do at the same time, from one integral.
+			//
+			// The add-on is told not to offset time itself (externalTime), or the
+			// exposure would be applied twice.
+			//
+			// Sized off the add-on's own sample count, which arrives a present or
+			// two after the request - until it does the step stays 0 and the clock
+			// simply holds, which is the correct thing to do while the geometry is
+			// still being built.
+			if (slidingDof())
+			{
+				// ONE STEP PER SAMPLE, not per present.
+				//
+				// The add-on spends several presents on each aperture sample - its own
+				// frame wait - so stepping every present advanced the clip by exactly
+				// that ratio too far. Measured as 4x at a 360-degree shutter and 2x at
+				// 180, i.e. frameWait x shutter, which is the signature of this bug.
+				//
+				// Armed only when the add-on's index MOVES, zero otherwise. That gives
+				// exactly `total` steps of shutter/total - the shutter - however many
+				// presents each sample took, and it stays right if the frame wait is
+				// changed in the panel.
+				const uint32_t total = fxcapture::dofSampleTotal();
+				const uint32_t idx   = fxcapture::dofSampleIndex();
+				const bool     moved = (idx != s_dofLastSample);
+				s_dofLastSample      = idx;
+
+				// Said once per render: if the index never moves, every present looks
+				// like a fresh sample and the over-advance is silent.
+				// `total` guards it as well as `moved`: the controller's step index
+				// starts at -1 and the count is published a present or two after the
+				// request, so the first transition is 0 -> 0xFFFFFFFF with a total of
+				// zero. Harmless - the step is gated on total too - but it printed
+				// "(4294967295 of 0)", which reads as a fault and is not one.
+				if (moved && total && !s_dofToldIndex)
+				{
+					s_dofToldIndex = true;
+					logger::write("info",
+						"render: aperture sample index is live (%u of %u) - stepping once "
+						"per sample", idx, total);
+				}
+
+				game::fixedTimeSetStep((moved && total)
+					? dofShutterMs() / (float)total : 0.0f);
+			}
+
+			if (fxcapture::dofStatus() == 3)
+			{
+				if (++s_dofRetries > kDofMaxRetries)
+				{
+					finish("aborted - the depth-of-field pass kept being refused. The usual "
+					       "cause is the IgcsDOF technique not being enabled in ReShade - "
+					       "turn it on from the Home tab and drag it to the bottom of the "
+					       "list. ReShade's own log names the reason", false);
+					return;
+				}
+				logger::write("info",
+					"render: the depth-of-field pass was refused at frame %d - retrying "
+					"(%d of %d). The add-on's log names the reason.",
+					s_frame, s_dofRetries, kDofMaxRetries);
+				s_dofSeq     = fxcapture::dofRequest(dofShutterMs(), s_cfg.dofBokehSize, s_cfg.dofQuality,
+						dofAutofocusNow(), s_cfg.dofFocusX, s_cfg.dofFocusY, dofFocusDeltaNow(),
+						slidingDof());
+				s_dofStartMs = GetTickCount();
+				return;
+			}
+
+			// DID THE CLOCK MOVE ACROSS THE SWEEP?
+			//
+			// The whole point of sliding + lens is that the world advances BETWEEN
+			// aperture samples, so a sample sees a slightly later instant than the
+			// one before it. If this span is ~0 the samples are all one instant and
+			// the result is bokeh with no motion blur - which looks identical to
+			// walking, and the frame-to-frame spacing cannot tell the two apart,
+			// because the seek to the next frame supplies that either way.
+			if (fxcapture::dofDone(s_dofSeq) && s_dofToldSpan != s_frame + 1)
+			{
+				s_dofToldSpan = s_frame + 1;
+				const float span = clockNow() - s_dofClockAtStart;
+				logger::write("info",
+					"render: frame %d - the clock moved %.2fms across the sweep, against "
+					"a %.2fms shutter.",
+					s_frame, span, dofShutterMs());
+			}
+
+			if (!fxcapture::dofDone(s_dofSeq))
+			{
+				if (GetTickCount() - s_dofStartMs > kDofGuardMs)
+					finish("aborted - the depth-of-field pass never finished", false);
+				return;
+			}
+
+			s_dofRetries = 0;
+
+			// The accumulated image is on screen and the add-on is holding the
+			// session open for exactly this. One plain capture - the sampling
+			// already happened, on the aperture.
+			char path[MAX_PATH];
+			buildPath(path, sizeof(path));
+			if (!fxcapture::requestSample(path, 1, 0))
+			{
+				finish("aborted - capture channel lost", false);
+				return;
+			}
+			s_guard = 0;
+			s_step  = Step::Ack;
+			return;
+		}
+
+		case Step::DofGap:
+		{
+			// The present that just went by carried the closed part of the frame.
+			// Zero the step before another one can spend it again - the engine
+			// steps on every Process(), whether or not we are looking.
+			//
+			// The clock is now on the next frame's instant by arithmetic, so the
+			// seek that follows agrees with it and moves nothing. It is still
+			// worth doing: it is what applies marker speed and carries a clip
+			// boundary.
+			// SPEND UNTIL THE CLOCK SAYS SO, not until a counter runs out.
+			//
+			// Sized off what is actually LEFT each time, so the last present cannot
+			// overshoot the way a fixed slice did, and equal slices in between so
+			// the render thread reads a representative value whenever it looks.
+			{
+				const float left = s_dofGapMs - (clockNow() - s_dofClockAtGap);
+				if (left > 0.01f && ++s_dofGapWait < kDofGapGuard)
+				{
+					const float slice = s_dofGapMs / (float)kDofGapPresents;
+					game::fixedTimeSetStep(left < slice ? left : slice);
+					return;
+				}
+			}
+
+			game::fixedTimeSetStep(0.0f);
+
+			// WHAT THE PRESENTS ACTUALLY MOVED, not what they were asked to.
+			//
+			// The whole point of spending a present here rather than crediting the
+			// accumulator is that a real step reaches fwTimer, and through it
+			// everything the replay simulates instead of storing. If this number
+			// comes back at ~0 the step was not taken and the seek below is doing
+			// the work again - which looks identical in the footage and is exactly
+			// the failure this was meant to remove.
+			if (s_frame < 3 || Config::get().splineDebugLog)
+			{
+				const float moved = clockNow() - s_dofClockAtGap;
+				logger::write("info",
+					"render: frame %d - the closed shutter moved the clock %.2fms of "
+					"the %.2fms asked for, across %d presents; %d presents in the "
+					"whole frame%s",
+					s_frame, moved, s_dofGapMs, s_dofGapWait + 1, s_dofPresents,
+					moved < 1.0f ? " - THE STEP WAS NOT TAKEN" : "");
+			}
+
+			seekAndSettle();
+			return;
+		}
+
+		case Step::ClipJump:
+		{
+			// Waiting on a clip step we asked for.
+			//
+			// Only reached when the engine did NOT drop the replay mode while it
+			// loaded; when it does, the mode-hold block above absorbs the wait
+			// and lands the jump itself. Both routes end in landClip(), so
+			// whichever gets there first is fine.
+			if (game::clipIndex() != s_wantClip || game::replayBusy() || s_spinnerSeen)
+			{
+				s_spinnerSeen = false;
+				if (++s_clipWait > kBusyGuard)
+				{
+					finish("aborted - clip step never landed", false);
+					return;
+				}
+
+				// Re-ask now and then, for the same reason the rewind does: the
+				// request is one field the engine reads on its own schedule and
+				// clears at a transition, so one that arrives mid-transition is
+				// dropped without trace.
+				if ((s_clipWait % 120) == 0)
+					game::jumpToClip(s_wantClip, s_wantClipAt);
+				return;
+			}
+			landClip();
+			return;
+		}
+
+		case Step::Ack:
+		{
+			if (!fxcapture::lastDone())
+			{
+				if (++s_guard > kAckGuard) finish("aborted - addon stopped responding", false);
+				return;
+			}
+
+			// Next sub-sample, or next output frame.
+			if (++s_sample >= s_cfg.samples)
+			{
+				s_sample = 0;
+
+				// Every sub-sample of this output frame has been accumulated and
+				// written, so the file is final. Hand it over BEFORE advancing -
+				// buildPath keys off s_frame, and the last frame has to go out
+				// before the finish() below returns.
+				if (videoout::active())
+				{
+					char done[MAX_PATH];
+					buildPath(done, sizeof(done));
+					videoout::pushFrame(done);
+				}
+
+				// The lens, per frame, as the add-on actually received it.
+				//
+				// The delta is not a constant: it is interpolated between markers, so a
+				// focus pull only shows up frame by frame. And because it is a
+				// DISPARITY it means nothing without the aperture it was measured
+				// against - the pair has to be logged together or neither number can
+				// be checked afterwards.
+				if (s_cfg.dof)
+					logger::write("info",
+						"render: frame %d lens - aperture %.4f, focus delta %.5f, %s",
+						s_frame, s_cfg.dofBokehSize, dofFocusDeltaNow(),
+						dofAutofocusNow() ? "autofocus" : "manual");
+
+				if (++s_frame >= s_frames) { finish("finished", true); return; }
+
+				reportProgress();
+			}
+
+			// THE CLOSED SHUTTER HAS TO BE LIVED THROUGH, NOT BOOKED.
+			//
+			// The aperture sweep advances the clock by the SHUTTER - `total` steps
+			// of shutter/total - and the rest of the frame used to be handed to
+			// fixedTimeSkip, which added it straight to the engine's nanosecond
+			// accumulator. That kept the accumulator level with the seek below, so
+			// the footage landed on the right instants and every frame LOOKED
+			// correct.
+			//
+			// But an accumulator write is not a time step. Anything the replay
+			// SIMULATES rather than stores integrates fwTimer::GetTimeStep(), and
+			// that only ever carries what a present actually stepped. The GPU
+			// weather particles are the visible case: CVisualEffects::Update ->
+			// CVfxWeather::Update -> CPtFxGPUManager::Update caches the frame delta
+			// and the drop shader advances by it. So rain was handed `shutter`
+			// milliseconds of time per `s_dt` milliseconds of footage and fell at
+			// exactly RenderShutter of its proper speed - half at 0.5, a quarter at
+			// 0.25, and right at 1.0, where the gap is zero and there was nothing
+			// to lose. The seek does not make it up either: a cursor jump restores
+			// RECORDED entities, and these are not recorded.
+			//
+			// So spend the gap rather than book it: one present with the clock
+			// stepping by it, which is what the non-lens sliding path already does
+			// with s_fxGapMs. The engine credits sm_exportTotalNs itself when it
+			// takes the step, so the accumulator still ends the frame level with
+			// the seek - the reason fixedTimeSkip existed - without the clock
+			// running ahead of its own target. One present on top of the ~236 an
+			// aperture sweep already costs at the default quality.
+			if (slidingDof())
+			{
+				const float gap = s_dt - dofShutterMs();
+				if (gap > 0.0f)
+				{
+					game::fixedTimeSetStep(gap / (float)kDofGapPresents);
+					s_dofGapMs      = gap;
+					s_dofGapWait    = 0;
+					s_dofClockAtGap = clockNow();
+					s_step = Step::DofGap;
+					return;
+				}
+			}
+
+			seekAndSettle();
+			return;
+		}
+
+		default:
+			s_step = Step::Idle;
+			return;
+		}
+	}
+}
