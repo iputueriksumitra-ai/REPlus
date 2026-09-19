@@ -9,6 +9,7 @@
 #include "capture/fxcapture.h"
 #include "capture/render.h"
 #include "capture/exporthook.h"
+#include "replay/editorwatermark.h"
 #include "lights/lights.h"
 
 static bool bInited = false;
@@ -26,6 +27,10 @@ static void InstallResolved()
 	fxcapture::init();
 	render::applyConfig();
 	render::installHooks();
+	// WOW TEAM SCENE V4: remove the Rockstar Editor identification overlay
+	// (star icon + render code/project label) before any RE+ frame capture.
+	// This is independent from the custom render pipeline and Cloud Hat.
+	editorwatermark::install();
 	smoothblend::install();
 	// WOW TEAM SCENE V2: prefer FiveM's scripting-gta native bridge. It is
 	// available independently of ScriptHookV's networkInited scheduling gate,

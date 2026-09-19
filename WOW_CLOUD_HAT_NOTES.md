@@ -1,15 +1,15 @@
-# WOW Cloud Hat Extension V3
+# WOW TEAM SCENE — RE+ extension
 
-V2 native execution path remains unchanged and is the confirmed working base.
+## V4 baseline
 
-## V3 UI behavior
+Preserves the confirmed-working V3 Cloud Hat system:
+- Scene Clouds page
+- Cloud Mode: As Recorded / Live
+- Live custom Cloud Hat and opacity
+- V2/V3 FiveM native execution path
 
-Scene Clouds now exposes an explicit **Cloud Mode**:
-
-- **As Recorded** - leaves/restores the cloud appearance recorded in the Rockstar Editor clip.
-- **Live** - applies the custom **Cloud Hat** and **Cloud Opacity** selected below.
-
-Cloud Hat and Cloud Opacity are intentionally disabled while Cloud Mode is As Recorded.
-The last custom hat/opacity remain saved, so switching back to Live restores the chosen custom look immediately.
-
-No `.clip` file is rewritten. The Cloud Hat remains state-driven; it is not reloaded every frame.
+V4 additions:
+- Visible UI branding changed from `Rockstar Editor+` to `Wow Editor`.
+- Rockstar Editor render-identification overlay (star icon + render code/project label) is suppressed with a narrow, signature-guarded patch.
+- Internal filenames/config paths remain `RockstarEditorPlus*` for compatibility.
+- FiveM corner branding and unrelated HUD/UI are intentionally untouched.

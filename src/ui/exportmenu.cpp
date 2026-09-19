@@ -311,7 +311,7 @@ namespace exportmenu
 		{
 			switch (row)
 			{
-			case ROW_ENABLE:    return "Rockstar Editor+";
+			case ROW_ENABLE:    return "Wow Editor";
 			case ROW_OUTPUT:    return "Output";
 			case ROW_PRESET:    return "Encoder Preset";
 			case ROW_FPS:       return "Frame Rate";
@@ -478,7 +478,7 @@ namespace exportmenu
 					  "live.";
 
 				snprintf(b, sizeof(b),
-					"Whether Export renders through Rockstar Editor+ or through the game's "
+					"Whether Export renders through Wow Editor or through the game's "
 					"own encoder.\n\n"
 					"On: no watermark, no codec re-compression, and the settings below "
 					"apply - true accumulation motion blur with an exact shutter, any frame "
@@ -488,7 +488,7 @@ namespace exportmenu
 					"hang off the game's bake and will simply never fire while this is on."
 					"\n\n"
 					"REQUIRES ReShade installed WITH FULL ADD-ON SUPPORT, plus the "
-					"IgcsConnector.addon64 that ships with Rockstar Editor+. A plain ASI "
+					"IgcsConnector.addon64 that ships with Wow Editor. A plain ASI "
 					"cannot read the GPU back buffer; that add-on is what does. Any other "
 					"IgcsConnector will NOT work - the bundled one carries the capture "
 					"channel this mod talks to.\n\n"
@@ -583,7 +583,7 @@ namespace exportmenu
 					"Sliding steps the clock between aperture samples, so one exposure "
 					"carries both the bokeh and the motion - particles keep moving "
 					"through it, which is what a real lens and shutter do together.\n\n"
-					"Focus is per marker: Rockstar Editor+ > Depth of Field. Aperture "
+					"Focus is per marker: Wow Editor > Depth of Field. Aperture "
 					"and quality are the two rows below.\n\n"
 					"Needs the capture add-on and IgcsDof.fx enabled in ReShade. "
 					"Samples is ignored - the aperture does the sampling - while "
@@ -711,7 +711,7 @@ namespace exportmenu
 		// ("Export") and stays in the player's language.
 		const char* stockGreyedHelp()
 		{
-			return "Inactive: Export is being rendered by Rockstar Editor+, which does "
+			return "Inactive: Export is being rendered by Wow Editor, which does "
 			       "not use the game's encoder, so this setting would not reach "
 			       "anything.\n\n"
 			       "Its own Frame Rate and Output rows are below. Set the Rockstar "

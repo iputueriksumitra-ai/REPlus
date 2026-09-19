@@ -807,7 +807,7 @@ namespace menu
 		{
 			switch (row)
 			{
-			case ROW_GROUP:     return "Rockstar Editor+";
+			case ROW_GROUP:     return "Wow Editor";
 			case ROW_STEP:      return "Adjust Step";
 			case ROW_PATH:      return "Spline Path";
 			case ROW_ROT:       return "Spline Rotation";
@@ -838,7 +838,7 @@ namespace menu
 			case ROW_G_ALPHA:   return "Curve Shape";
 			case ROW_G_WEIGHT:  return "Camera Weight";
 			case ROW_G_PROFILE: return "Speed Profile";
-			case ROW_G_HEADER:  return "Rockstar Editor+";
+			case ROW_G_HEADER:  return "Wow Editor";
 			case ROW_S_TIME:    return "Time of Day";
 			case ROW_S_WEATHER: return "Weather";
 			case ROW_S_BLENDTO: return "Weather Blend To";
@@ -1236,9 +1236,9 @@ namespace menu
 			{
 			case ROW_GROUP:
 				return g_ourShakeHere
-					? "Which group of Rockstar Editor+ settings this marker shows."
-					: "Which group of Rockstar Editor+ settings this marker shows. "
-					  "Set the Shake row to Rockstar Editor+ to reach the shake pages.";
+					? "Which group of Wow Editor settings this marker shows."
+					: "Which group of Wow Editor settings this marker shows. "
+					  "Set the Shake row to Wow Editor to reach the shake pages.";
 			case ROW_STEP:
 				return "How far one press of left or right moves a value on this page.";
 
@@ -1406,7 +1406,7 @@ namespace menu
 
 			// --- global rows, top-level marker menu ---
 			case ROW_G_HEADER:
-				return "Rockstar Editor+ settings for the whole session. Accept pages "
+				return "Wow Editor settings for the whole session. Accept pages "
 				       "through Curve, Limits, Scene, Scene Lights and Scene Clouds.";
 			case ROW_G_PATH:  return "Replace the marker-to-marker camera PATH with a curve.";
 			case ROW_G_ROT:   return "Replace the marker-to-marker camera ROTATION with a curve.";
@@ -2312,7 +2312,7 @@ namespace menu
 		// hooks, so opening a submenu we do not hook - Audio, for one - leaves
 		// both stale. Focus then lands on the same index our header occupied and
 		// every ownership test passes, which is why stepping "Microphone Type"
-		// paged the Rockstar Editor+ row instead.
+		// paged the Wow Editor row instead.
 		//
 		// So ask the live menu array rather than our own memory of it. Both
 		// populate paths stamp OURS_OPTION_ID into the option they push, and the
@@ -2384,7 +2384,7 @@ namespace menu
 		void relabelShakeRow()
 		{
 			if (!g_ourShakeHere || g_shakeRow < 0 || !game::addr_UpdateItemText) return;
-			((FnUpdateText)game::addr_UpdateItemText)(g_shakeRow, "Rockstar Editor+");
+			((FnUpdateText)game::addr_UpdateItemText)(g_shakeRow, "Wow Editor");
 		}
 
 		// --- hooks ------------------------------------------------------------
@@ -2885,7 +2885,7 @@ namespace menu
 			}
 
 			// The stock Shake row gains a seventh choice after Explosion:
-			// "Rockstar Editor+". It is our flag rather than a marker value -
+			// "Wow Editor". It is our flag rather than a marker value -
 			// see MarkerSettings::ourShake for why a real 7th m_shakeType is not
 			// an option. Stepping onto it parks the marker on MARKER_SHAKE_NONE
 			// so the game applies no shake of its own and ours takes over.
