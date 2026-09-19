@@ -17,6 +17,8 @@
 #include "lights/lightstore.h"
 
 #include <cstdio>
+#include <mutex>
+#include <string>
 
 // =============================================================================
 //  Injecting rows into the editor's own camera menu
@@ -150,7 +152,21 @@ namespace menu
 		FnPopulate    origPopulate       = nullptr;
 		FnPopulate    origPopulateMarker = nullptr;
 		FnBeginMethod origBeginMethod = nullptr;
+		FnAddParamStr origAddParamStr = nullptr;
 		FnMenuInput   origMenuInput   = nullptr;
+
+		// Rockstar's PC title/name entry uses TEXT_INPUT_BOX. Its wrapper funnels
+		// UPDATE_INPUT through the same CScaleformMgr::BeginMethod and
+		// AddParamString functions already resolved by RE+.
+		//
+		// Thread-local method state is important: Scaleform can be driven from
+		// more than one thread, while the remembered text itself is shared with
+		// the Export hook on the game thread.
+		thread_local bool s_textInputUpdate = false;
+		thread_local int  s_textInputStringParam = 0;
+		std::mutex        s_textInputMutex;
+		std::string       s_lastTextInput;
+		DWORD             s_lastTextInputAt = 0;
 
 		bool g_inCamMenu = false;
 		bool g_injecting = false;
@@ -2644,10 +2660,34 @@ namespace menu
 			    || row == ROW_L_SHADOWS;   // reveals Shadow Quality
 		}
 
+		void __fastcall hkAddParamString(const char* value, bool convertToHtml)
+		{
+			// TEXT_INPUT_BOX::Update() sends:
+			//   BeginMethod("UPDATE_INPUT")
+			//   AddParamString(currentText, false)
+			//   AddParam(cursor)
+			// so the first string is exactly what is visible in Rockstar's own
+			// input box. We only remember it; the BAKE interception decides
+			// whether that text really belongs to an Export press.
+			if (s_textInputUpdate && s_textInputStringParam++ == 0 && value)
+			{
+				std::lock_guard<std::mutex> lock(s_textInputMutex);
+				s_lastTextInput = value;
+				s_lastTextInputAt = GetTickCount();
+			}
+
+			origAddParamStr(value, convertToHtml);
+		}
+
 		// `b` is pointer-sized so Enhanced's context pointer survives the
 		// pass-through untouched - see FnBeginMethod.
 		char __fastcall hkBeginMethod(int movie, int cls, const char* method, int a, void* b)
 		{
+			// The wrapper used by TEXT_INPUT_BOX ends up here too. Reset the
+			// per-method capture state before anything else can issue params.
+			s_textInputUpdate = method && strcmp(method, "UPDATE_INPUT") == 0;
+			s_textInputStringParam = 0;
+
 			// Borrowing this hook as a general heartbeat, because it is the only
 			// one the mod owns that runs in ordinary gameplay as well as in the
 			// editor - and scene's timecycle flags MUST be put back when the
@@ -3024,6 +3064,28 @@ namespace menu
 		}
 	}
 
+	bool consumeRecentTextInput(char* out, int outCap, unsigned maxAgeMs)
+	{
+		if (!out || outCap <= 0) return false;
+		out[0] = '\0';
+
+		std::lock_guard<std::mutex> lock(s_textInputMutex);
+		if (s_lastTextInput.empty() || s_lastTextInputAt == 0) return false;
+
+		const DWORD age = GetTickCount() - s_lastTextInputAt;
+		if (age > maxAgeMs)
+		{
+			s_lastTextInput.clear();
+			s_lastTextInputAt = 0;
+			return false;
+		}
+
+		strncpy_s(out, (size_t)outCap, s_lastTextInput.c_str(), _TRUNCATE);
+		s_lastTextInput.clear();
+		s_lastTextInputAt = 0;
+		return out[0] != '\0';
+	}
+
 	// See menu.h. A thin forward so the scene-light track can key against the
 	// same marker every per-marker row here already keys against, rather than
 	// reproducing this build-specific pointer chase a second time.
@@ -3065,6 +3127,7 @@ namespace menu
 
 		memory(game::addr_PopulateCameraMenu).hook(hkPopulate, &origPopulate, "PopulateCameraMenu");
 		memory(game::addr_BeginMethod).hook(hkBeginMethod, &origBeginMethod, "BeginMethod");
+		memory(game::addr_AddParamString).hook(hkAddParamString, &origAddParamStr, "AddParamStringExportTitle");
 		memory(game::addr_MenuInput).hook(hkMenuInput,   &origMenuInput);
 
 		// Optional: without it we simply lose the global rows. The camera

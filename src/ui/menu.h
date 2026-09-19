@@ -31,4 +31,9 @@ namespace menu
 	// not that one, and a track keyed on the director's would keep filing edits
 	// against whichever marker was open before.
 	void* currentEditMarker();
+
+	// Consume the most recent UTF-8 text emitted by Rockstar's own TEXT_INPUT_BOX.
+	// Export uses this immediately when PLAYBACK_TYPE_BAKE arrives, so unrelated
+	// text boxes are rejected by the short age window at the call site.
+	bool consumeRecentTextInput(char* out, int outCap, unsigned maxAgeMs);
 }

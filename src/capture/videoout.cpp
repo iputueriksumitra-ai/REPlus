@@ -7,6 +7,7 @@
 
 #include "main.h"
 #include "capture/videoout.h"
+#include "capture/exporthook.h"
 
 #include "utils/paths.h"
 
@@ -517,8 +518,27 @@ namespace videoout
 		s_renderFolder = folder ? folder : "";
 		s_outExt        = ext;
 		{
+			// Match original Rockstar Export semantics: the name the user typed
+			// immediately before confirming Export is the final filename.
+			// Project name is only the fallback when that title could not be
+			// observed (for example on a future build whose text UI changed).
+			const std::string requested = exporthook::takeRequestedName();
 			const char* project = game::projectName();
-			s_projectStem = safeFileStem(project && *project ? project : "Wow Render");
+
+			if (!requested.empty())
+			{
+				s_projectStem = safeFileStem(requested.c_str());
+				logger::write("info",
+					"video: final filename uses Rockstar export title '%s'",
+					requested.c_str());
+			}
+			else
+			{
+				s_projectStem = safeFileStem(project && *project ? project : "Wow Render");
+				logger::write("info",
+					"video: final filename falls back to project name '%s'",
+					s_projectStem.c_str());
+			}
 		}
 
 		snprintf(s_outPath, sizeof(s_outPath), "%s\\video.%s", folder, ext.c_str());

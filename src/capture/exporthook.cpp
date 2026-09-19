@@ -11,6 +11,8 @@
 #include "capture/fxcapture.h"
 #include "game/signatures.h"
 
+#include <string>
+
 // =============================================================================
 //  Export -> image sequence
 // =============================================================================
@@ -39,6 +41,11 @@ namespace exporthook
 		// The render cannot begin here: Open has not finished setting playback
 		// up yet, and the replay clock is not usable until it has.
 		bool s_pending = false;
+
+		// The title typed into Rockstar's own Export text box, snapshotted at
+		// the BAKE call. videoout::begin() takes it once the custom playback is
+		// ready. Empty means fall back to the project name.
+		std::string s_requestedName;
 
 		// How many times Open has actually been intercepted. Zero after the user
 		// has pressed Export is the whole diagnosis: the pattern resolved to
@@ -87,6 +94,26 @@ namespace exporthook
 			{
 				if (fxcapture::addonPresent())
 				{
+					// The Rockstar title box updates Scaleform continuously, so
+					// its final accepted text is normally only a frame or two old
+					// here. Fifteen seconds leaves ample room for UI transitions
+					// without ever treating an old rename/chat box as this export.
+					char typed[512]{};
+					s_requestedName.clear();
+					if (menu::consumeRecentTextInput(typed, (int)sizeof(typed), 15000))
+					{
+						s_requestedName = typed;
+						logger::write("info",
+							"export: Rockstar export title captured -> '%s'",
+							s_requestedName.c_str());
+					}
+					else
+					{
+						logger::write("info",
+							"export: no recent Rockstar export title captured - "
+							"the project name will be used");
+					}
+
 					type      = gsig::PLAYBACK_TYPE_PREVIEW_FULL_PROJECT;
 					s_pending = true;
 					logger::write("info", "export: bake diverted to the RE+ renderer");
@@ -136,6 +163,13 @@ namespace exporthook
 	bool     pending()   { return s_pending; }
 	void     clearPending() { s_pending = false; }
 	unsigned openCount() { return s_opens; }
+
+	std::string takeRequestedName()
+	{
+		std::string out;
+		out.swap(s_requestedName);
+		return out;
+	}
 
 	// Did our detour ever get written? Distinct from hookIntact(), and the
 	// distinction matters: with the two conflated, a hook that FAILED TO INSTALL

@@ -6,6 +6,7 @@
 // Software Foundation. See the LICENSE file for details.
 
 #pragma once
+#include <string>
 
 // Redirects the editor's Export button to the image-sequence renderer.
 // See exporthook.cpp for why this is one rewritten argument and not menu rows.
@@ -33,4 +34,9 @@ namespace exporthook
 	// completely different advice.
 	bool hookInstalled();
 	void clearPending();
+
+	// The exact text accepted in Rockstar's own Export title box for the
+	// pending custom render. One-shot: calling this transfers and clears it.
+	// Empty means the title was unavailable and videoout should use the project.
+	std::string takeRequestedName();
 }

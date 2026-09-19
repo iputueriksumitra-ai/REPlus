@@ -1,4 +1,4 @@
-name: Build WOW Editor V5.5 Project Output
+name: Build WOW Editor V5.6 Original Export Title
 
 on:
   workflow_dispatch:
@@ -59,7 +59,7 @@ jobs:
           if (!$ffmpeg) { throw "ffmpeg.exe not found in downloaded archive" }
           Write-Host "FFmpeg: $($ffmpeg.FullName)"
 
-      - name: Collect complete V5.3 FiveM package
+      - name: Collect complete V5.6 FiveM package
         shell: pwsh
         run: |
           $root      = "artifact"
@@ -101,10 +101,10 @@ jobs:
           }
 
           $install = @(
-            "WOW EDITOR V5.3 - FIVEM RESHADE LAYOUT FIX",
+            "WOW EDITOR V5.6 - ORIGINAL ROCKSTAR EXPORT TITLE",
             "===========================================",
             "",
-            "V5.3 keeps V4/V3 behavior unchanged and only corrects the FiveM packaging layout.",
+            "V5.6 keeps the proven renderer and names the final file from Rockstar's own Export title box.",
             "",
             "INSTALL",
             "-------",
@@ -147,13 +147,13 @@ jobs:
             "Typical custom-render output:",
             "  %LOCALAPPDATA%\FiveM\FiveM.app\plugins\RockstarEditorPlus\Captures\"
           )
-          $install | Set-Content -Path (Join-Path $root "INSTALL_V5.3.txt") -Encoding UTF8
+          $install | Set-Content -Path (Join-Path $root "INSTALL_V5.6.txt") -Encoding UTF8
 
           if (Test-Path "WOW_CLOUD_HAT_NOTES.md") {
             Copy-Item "WOW_CLOUD_HAT_NOTES.md" $root
           }
 
-      - name: Verify V5.3 package contents
+      - name: Verify V5.6 package contents
         shell: pwsh
         run: |
           $required = @(
@@ -161,16 +161,16 @@ jobs:
             "artifact/FiveM.app/plugins/IgcsConnector.addon64",
             "artifact/FiveM.app/plugins/RockstarEditorPlus/ffmpeg.exe",
             "artifact/FiveM.app/plugins/reshade-shaders/Shaders/IgcsDof.fx",
-            "artifact/INSTALL_V5.3.txt"
+            "artifact/INSTALL_V5.6.txt"
           )
           foreach ($p in $required) {
             if (!(Test-Path $p)) { throw "V5.3 package missing required file: $p" }
             Write-Host "OK $p"
           }
 
-      - name: Upload V5.3 artifact
+      - name: Upload V5.6 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WOW-Editor-V5.5-Project-Named-Output
+          name: WOW-Editor-V5.6-Original-Export-Title
           path: artifact
           compression-level: 6
