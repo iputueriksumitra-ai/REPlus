@@ -209,9 +209,11 @@ namespace menu
 			ROW_S_TIME, ROW_S_WEATHER, ROW_S_BLENDTO, ROW_S_BLEND, ROW_S_WETNESS,
 			ROW_S_TIMECYCLE,
 			// WOW TEAM SCENE: runtime Cloud Hat overlay for Rockstar Editor.
+			// Mode is explicit: As Recorded leaves the clip untouched, while Live
+			// applies the custom Cloud Hat + opacity selected below.
 			// Kept on its own page so the stock 16-row Scaleform limit is never
 			// exceeded and all original Scene rows remain intact.
-			ROW_CLOUD_HAT, ROW_CLOUD_OPACITY,
+			ROW_CLOUD_MODE, ROW_CLOUD_HAT, ROW_CLOUD_OPACITY,
 			// An ACTION row, not a value row: accept performs it, left/right do
 			// nothing. It appears in every shake group because that is where you
 			// are standing when you decide the take needs it everywhere, and
@@ -703,6 +705,7 @@ namespace menu
 				{
 					// Separate page by design: the marker menu has a hard 16-row
 					// display limit. This preserves every original Scene control.
+					s_rows[s_shown++] = ROW_CLOUD_MODE;
 					s_rows[s_shown++] = ROW_CLOUD_HAT;
 					s_rows[s_shown++] = ROW_CLOUD_OPACITY;
 				}
@@ -842,6 +845,7 @@ namespace menu
 			case ROW_S_BLEND:   return "Weather Blend";
 			case ROW_S_WETNESS: return "Wetness";
 			case ROW_S_TIMECYCLE: return "Timecycle";
+			case ROW_CLOUD_MODE: return "Cloud Mode";
 			case ROW_CLOUD_HAT: return "Cloud Hat";
 			case ROW_CLOUD_OPACITY: return "Cloud Opacity";
 			case ROW_APPLY_ALL: return "Apply Shake to All";
@@ -1132,12 +1136,10 @@ namespace menu
 				return Config::get().liveTimecycle ? "Live" : "As Recorded";
 
 			// --- WOW TEAM SCENE: Cloud Hat replay overlay ---
+			if (row == ROW_CLOUD_MODE)
+				return Config::get().overrideCloudHat ? "Live" : "As Recorded";
 			if (row == ROW_CLOUD_HAT)
-			{
-				const Config& c = Config::get();
-				if (!c.overrideCloudHat) return "As Recorded";
-				return cloudhat::typeName(c.cloudHatType);
-			}
+				return cloudhat::typeName(Config::get().cloudHatType);
 			if (row == ROW_CLOUD_OPACITY)
 			{
 				sprintf_s(buf, "%d%%", (int)(Config::get().cloudHatOpacity * 100.0f + 0.5f));
@@ -1201,7 +1203,8 @@ namespace menu
 			case ROW_S_BLEND:   return 21;
 			case ROW_S_WETNESS: return kWetSlots + 1;
 			case ROW_S_TIMECYCLE: return 2;
-			case ROW_CLOUD_HAT: return cloudhat::typeCount() + 1;
+			case ROW_CLOUD_MODE: return 2;
+			case ROW_CLOUD_HAT: return cloudhat::typeCount();
 			case ROW_CLOUD_OPACITY: return 21;
 			default: return -1;
 			}
@@ -1472,19 +1475,28 @@ namespace menu
 				       "this page off - use it if the shot had an interior or mission "
 				       "colour grade.";
 
+			case ROW_CLOUD_MODE:
+				if (!cloudhat::ready())
+					return "Unavailable: the FiveM Rockstar Editor native bridge is not ready. "
+					       "Load a clip/session first, then reopen this page.";
+				return c.overrideCloudHat
+					? "Live uses the custom Cloud Hat and opacity selected below. "
+					  "Switch back to As Recorded to restore the clip's recorded sky."
+					: "As Recorded leaves the clip's recorded cloud appearance untouched. "
+					  "Switch to Live to use the custom Cloud Hat selected below.";
 			case ROW_CLOUD_HAT:
 				if (!cloudhat::ready())
-					return "Unavailable: FiveM's ScriptHookV native bridge is not ready. "
-					       "Load a clip/session first, then reopen this page.";
-				return "Force a GTA Cloud Hat during Rockstar Editor playback/render. "
-				       "This is separate from Weather because Cloud Hats are runtime state "
-				       "and are not reliably serialized into the .clip.";
+					return "Unavailable: the FiveM Rockstar Editor native bridge is not ready.";
+				if (!c.overrideCloudHat)
+					return "Switch Cloud Mode to Live first. The selected custom hat is remembered.";
+				return "Custom GTA Cloud Hat used while Cloud Mode is Live. This is separate "
+				       "from Weather and does not rewrite the .clip.";
 			case ROW_CLOUD_OPACITY:
 				if (!cloudhat::ready())
-					return "Unavailable: FiveM's ScriptHookV native bridge is not ready.";
+					return "Unavailable: the FiveM Rockstar Editor native bridge is not ready.";
 				if (!c.overrideCloudHat)
-					return "Set Cloud Hat to something other than As Recorded first.";
-				return "Opacity of the forced Cloud Hat, from 0% to 100%. Applied only "
+					return "Switch Cloud Mode to Live first.";
+				return "Opacity of the Live custom Cloud Hat, from 0% to 100%. Applied only "
 				       "when the value changes; it is not reasserted every frame.";
 			case ROW_COLLISION:
 				return "Off lets the camera pass through geometry, which also stops the "
@@ -1604,10 +1616,14 @@ namespace menu
 				return kOurRestriction;
 
 			// Cloud Hats are independent from the replay weather/timecycle hook.
-			// They only need FiveM's ScriptHookV native bridge.
-			if ((row == ROW_CLOUD_HAT || row == ROW_CLOUD_OPACITY) && !cloudhat::ready())
+			// V2 uses the FiveM Rockstar Editor native bridge. The Mode row stays
+			// available whenever that bridge is ready; custom controls only become
+			// editable in Live mode.
+			if ((row == ROW_CLOUD_MODE || row == ROW_CLOUD_HAT || row == ROW_CLOUD_OPACITY)
+			    && !cloudhat::ready())
 				return kOurRestriction;
-			if (row == ROW_CLOUD_OPACITY && !Config::get().overrideCloudHat)
+			if ((row == ROW_CLOUD_HAT || row == ROW_CLOUD_OPACITY)
+			    && !Config::get().overrideCloudHat)
 				return kOurRestriction;
 
 			return gsig::EDIT_RESTRICTION_NONE;
@@ -1957,18 +1973,21 @@ namespace menu
 				return;
 			}
 
+			if (row == ROW_CLOUD_MODE)
+			{
+				Config& c = Config::get();
+				c.overrideCloudHat = delta > 0;
+				c.writeBool("OverrideCloudHat", c.overrideCloudHat);
+				return;
+			}
 			if (row == ROW_CLOUD_HAT)
 			{
 				Config& c = Config::get();
 				const int count = cloudhat::typeCount();
-				const int cur = c.overrideCloudHat ? 1 + c.cloudHatType : 0;
-				int next = cur + delta;
+				int next = c.cloudHatType + delta;
 				if (next < 0) next = 0;
-				if (next > count) next = count;
-
-				c.overrideCloudHat = next > 0;
-				if (next > 0) c.cloudHatType = next - 1;
-				c.writeBool("OverrideCloudHat", c.overrideCloudHat);
+				if (next >= count) next = count - 1;
+				c.cloudHatType = next;
 				c.writeInt("CloudHatType", c.cloudHatType);
 				return;
 			}
@@ -2616,7 +2635,7 @@ namespace menu
 			    || row == ROW_S_TIMECYCLE   // the Scene page's master switch
 			    || row == ROW_S_WEATHER
 			    || row == ROW_S_BLENDTO
-			    || row == ROW_CLOUD_HAT // enables/disables Cloud Opacity
+			    || row == ROW_CLOUD_MODE // enables/disables custom Cloud Hat controls
 			    // Selecting a different light re-reads every row below it, and
 			    // switching Point/Spot adds or removes the Cone Angle row.
 			    || row == ROW_L_SELECT

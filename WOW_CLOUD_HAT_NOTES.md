@@ -1,21 +1,15 @@
-# WOW TEAM SCENE - Rockstar Editor+ Cloud Hat Extension V2
+# WOW Cloud Hat Extension V3
 
-V2 fixes the FiveM Rockstar Editor execution path.
+V2 native execution path remains unchanged and is the confirmed working base.
 
-## What changed
+## V3 UI behavior
 
-- Cloud Hat native calls no longer depend on ScriptHookV's scheduled fiber while Rockstar Editor owns playback.
-- On FiveM, the extension prefers `scripting-gta.dll` and calls the exported `fx::ScriptEngine::CallNativeHandler` bridge directly.
-- The existing ScriptHookV bridge remains as a fallback for non-FiveM/ordinary ASI environments.
-- Cloud Hat updates run from RE+'s own editor/Scaleform heartbeat, which remains active during Rockstar Editor playback.
-- New Cloud Hats use a short `PRELOAD_CLOUD_HAT` -> `LOAD_CLOUD_HAT` state transition before opacity is applied.
-- `LOAD_CLOUD_HAT` is still state-driven and is NOT spammed every frame.
+Scene Clouds now exposes an explicit **Cloud Mode**:
 
-## Test
+- **As Recorded** - leaves/restores the cloud appearance recorded in the Rockstar Editor clip.
+- **Live** - applies the custom **Cloud Hat** and **Cloud Opacity** selected below.
 
-Rockstar Editor+ -> Scene Clouds
+Cloud Hat and Cloud Opacity are intentionally disabled while Cloud Mode is As Recorded.
+The last custom hat/opacity remain saved, so switching back to Live restores the chosen custom look immediately.
 
-- Cloud Hat: Cloudy 01
-- Cloud Opacity: 100%
-
-Then play/scrub the clip and confirm the Cloudy 01 hat is visible during editor playback/render.
+No `.clip` file is rewritten. The Cloud Hat remains state-driven; it is not reloaded every frame.

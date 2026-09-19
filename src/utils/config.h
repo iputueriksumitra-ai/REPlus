@@ -446,9 +446,10 @@ struct Config
 	float weatherWetness = -1.0f;
 
 	// WOW TEAM SCENE - Cloud Hat overlay for Rockstar Editor playback.
-	// Cloud Hats are a separate runtime layer from CPacketWeather and are not
-	// reliably serialized into a .clip, so this override is applied live by the
-	// ScriptHookV game-thread bridge. Off means this extension touches nothing.
+	// Cloud Hats are a separate runtime layer from CPacketWeather. The UI exposes
+	// this bool as Cloud Mode: As Recorded (false) / Live (true). Live applies the
+	// custom Cloud Hat + opacity through the FiveM Rockstar Editor native bridge;
+	// As Recorded touches nothing and restores the clip's recorded appearance.
 	bool  overrideCloudHat = false;
 	int   cloudHatType = 4;          // Cloudy 01 in cloudhat.cpp's list
 	float cloudHatOpacity = 1.0f;    // 0..1
