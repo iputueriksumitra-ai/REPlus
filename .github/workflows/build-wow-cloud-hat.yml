@@ -1,0 +1,37 @@
+name: Build WOW Cloud Hat REPlus
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - wow-cloud-hat-extension
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure x64 Release
+        shell: pwsh
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Collect files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item build/BIN/Release/RockstarEditorPlus.asi artifact/
+          if (Test-Path build/BIN/Release/RockstarEditorPlus.ini) { Copy-Item build/BIN/Release/RockstarEditorPlus.ini artifact/ }
+          if (Test-Path build/BIN/Release/Render.ini) { Copy-Item build/BIN/Release/Render.ini artifact/ }
+          Copy-Item WOW_CLOUD_HAT_NOTES.md artifact/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RockstarEditorPlus-WOW-CloudHat
+          path: artifact

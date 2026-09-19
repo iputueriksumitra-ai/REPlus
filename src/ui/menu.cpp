@@ -1,4 +1,4 @@
-﻿// This file is part of RockstarEditorPlus.
+// This file is part of RockstarEditorPlus.
 // Copyright (C) 2026 CoreFX (crxhvrd@proton.me)
 // SPDX-License-Identifier: GPL-3.0-only
 // RockstarEditorPlus is free software: you can redistribute it and/or modify it
@@ -171,7 +171,7 @@ namespace menu
 		// is the one group here that changes what the shot LOOKS like rather
 		// than what the camera is allowed to do.
 		enum { PAGE_CLOSED = 0, PAGE_CURVE, PAGE_LIMITS, PAGE_SCENE,
-		       PAGE_LIGHTS, PAGE_COUNT };
+		       PAGE_LIGHTS, PAGE_CLOUDS, PAGE_COUNT };
 		int  g_page         = PAGE_CLOSED;
 		bool g_stockShakeSet = false; // marker has a GAME shake, so the camera
 		                              // menu will also draw intensity + speed
@@ -208,6 +208,10 @@ namespace menu
 			// moment the row goes back to "As Recorded".
 			ROW_S_TIME, ROW_S_WEATHER, ROW_S_BLENDTO, ROW_S_BLEND, ROW_S_WETNESS,
 			ROW_S_TIMECYCLE,
+			// WOW TEAM SCENE: runtime Cloud Hat overlay for Rockstar Editor.
+			// Kept on its own page so the stock 16-row Scaleform limit is never
+			// exceeded and all original Scene rows remain intact.
+			ROW_CLOUD_HAT, ROW_CLOUD_OPACITY,
 			// An ACTION row, not a value row: accept performs it, left/right do
 			// nothing. It appears in every shake group because that is where you
 			// are standing when you decide the take needs it everywhere, and
@@ -297,7 +301,7 @@ namespace menu
 		inline bool isNumeric(int row) { return row >= ROW_NUM_FIRST; }
 		inline bool isGlobalRow(int row)
 		{
-			return row >= ROW_COLLISION && row <= ROW_S_TIMECYCLE;
+			return row >= ROW_COLLISION && row <= ROW_CLOUD_OPACITY;
 		}
 
 		inline bool isSceneRow(int row)
@@ -695,6 +699,13 @@ namespace menu
 					s_rows[s_shown++] = ROW_STREAMFOCUS;
 					s_rows[s_shown++] = ROW_ZOOM;
 				}
+				else if (g_page == PAGE_CLOUDS)
+				{
+					// Separate page by design: the marker menu has a hard 16-row
+					// display limit. This preserves every original Scene control.
+					s_rows[s_shown++] = ROW_CLOUD_HAT;
+					s_rows[s_shown++] = ROW_CLOUD_OPACITY;
+				}
 				else
 				{
 					// Timecycle first: it is the master switch, and every row
@@ -831,6 +842,8 @@ namespace menu
 			case ROW_S_BLEND:   return "Weather Blend";
 			case ROW_S_WETNESS: return "Wetness";
 			case ROW_S_TIMECYCLE: return "Timecycle";
+			case ROW_CLOUD_HAT: return "Cloud Hat";
+			case ROW_CLOUD_OPACITY: return "Cloud Opacity";
 			case ROW_APPLY_ALL: return "Apply Shake to All";
 
 			// --- scene lights ---
@@ -1057,6 +1070,7 @@ namespace menu
 				     : g_page == PAGE_LIMITS ? "Limits"
 				     : g_page == PAGE_SCENE  ? "Scene"
 				     : g_page == PAGE_LIGHTS ? "Scene Lights"
+				     : g_page == PAGE_CLOUDS ? "Scene Clouds"
 				                             : "Closed";
 			if (row == ROW_G_PATH)
 				return (Config::get().splinePosition ? "On" : "Off");
@@ -1117,6 +1131,19 @@ namespace menu
 			if (row == ROW_S_TIMECYCLE)
 				return Config::get().liveTimecycle ? "Live" : "As Recorded";
 
+			// --- WOW TEAM SCENE: Cloud Hat replay overlay ---
+			if (row == ROW_CLOUD_HAT)
+			{
+				const Config& c = Config::get();
+				if (!c.overrideCloudHat) return "As Recorded";
+				return cloudhat::typeName(c.cloudHatType);
+			}
+			if (row == ROW_CLOUD_OPACITY)
+			{
+				sprintf_s(buf, "%d%%", (int)(Config::get().cloudHatOpacity * 100.0f + 0.5f));
+				return buf;
+			}
+
 			const Num* n = numFor(row);
 			if (!n) return "";
 			if (!s.has(n->param)) return "Default";
@@ -1174,6 +1201,8 @@ namespace menu
 			case ROW_S_BLEND:   return 21;
 			case ROW_S_WETNESS: return kWetSlots + 1;
 			case ROW_S_TIMECYCLE: return 2;
+			case ROW_CLOUD_HAT: return cloudhat::typeCount() + 1;
+			case ROW_CLOUD_OPACITY: return 21;
 			default: return -1;
 			}
 		}
@@ -1375,7 +1404,7 @@ namespace menu
 			// --- global rows, top-level marker menu ---
 			case ROW_G_HEADER:
 				return "Rockstar Editor+ settings for the whole session. Accept pages "
-				       "through Curve, Limits and Scene.";
+				       "through Curve, Limits, Scene, Scene Lights and Scene Clouds.";
 			case ROW_G_PATH:  return "Replace the marker-to-marker camera PATH with a curve.";
 			case ROW_G_ROT:   return "Replace the marker-to-marker camera ROTATION with a curve.";
 			case ROW_G_FOV:   return "Replace the marker-to-marker ZOOM blend with a curve.";
@@ -1442,6 +1471,21 @@ namespace menu
 				       "Recorded keeps the clip's own lighting and switches the rest of "
 				       "this page off - use it if the shot had an interior or mission "
 				       "colour grade.";
+
+			case ROW_CLOUD_HAT:
+				if (!cloudhat::ready())
+					return "Unavailable: FiveM's ScriptHookV native bridge is not ready. "
+					       "Load a clip/session first, then reopen this page.";
+				return "Force a GTA Cloud Hat during Rockstar Editor playback/render. "
+				       "This is separate from Weather because Cloud Hats are runtime state "
+				       "and are not reliably serialized into the .clip.";
+			case ROW_CLOUD_OPACITY:
+				if (!cloudhat::ready())
+					return "Unavailable: FiveM's ScriptHookV native bridge is not ready.";
+				if (!c.overrideCloudHat)
+					return "Set Cloud Hat to something other than As Recorded first.";
+				return "Opacity of the forced Cloud Hat, from 0% to 100%. Applied only "
+				       "when the value changes; it is not reasserted every frame.";
 			case ROW_COLLISION:
 				return "Off lets the camera pass through geometry, which also stops the "
 				       "push-off bending the path away from your markers.";
@@ -1557,6 +1601,13 @@ namespace menu
 			if ((row == ROW_S_BLENDTO || row == ROW_S_BLEND) && !Config::get().overrideWeather)
 				return kOurRestriction;
 			if (row == ROW_S_BLEND && Config::get().weatherBlendTo < 0)
+				return kOurRestriction;
+
+			// Cloud Hats are independent from the replay weather/timecycle hook.
+			// They only need FiveM's ScriptHookV native bridge.
+			if ((row == ROW_CLOUD_HAT || row == ROW_CLOUD_OPACITY) && !cloudhat::ready())
+				return kOurRestriction;
+			if (row == ROW_CLOUD_OPACITY && !Config::get().overrideCloudHat)
 				return kOurRestriction;
 
 			return gsig::EDIT_RESTRICTION_NONE;
@@ -1903,6 +1954,32 @@ namespace menu
 				Config& c = Config::get();
 				c.liveTimecycle = delta > 0;
 				c.writeBool("LiveTimecycle", c.liveTimecycle);
+				return;
+			}
+
+			if (row == ROW_CLOUD_HAT)
+			{
+				Config& c = Config::get();
+				const int count = cloudhat::typeCount();
+				const int cur = c.overrideCloudHat ? 1 + c.cloudHatType : 0;
+				int next = cur + delta;
+				if (next < 0) next = 0;
+				if (next > count) next = count;
+
+				c.overrideCloudHat = next > 0;
+				if (next > 0) c.cloudHatType = next - 1;
+				c.writeBool("OverrideCloudHat", c.overrideCloudHat);
+				c.writeInt("CloudHatType", c.cloudHatType);
+				return;
+			}
+			if (row == ROW_CLOUD_OPACITY)
+			{
+				Config& c = Config::get();
+				int slot = (int)(c.cloudHatOpacity * 20.0f + 0.5f) + delta;
+				if (slot < 0) slot = 0;
+				if (slot > 20) slot = 20;
+				c.cloudHatOpacity = slot * 0.05f;
+				c.writeFloat("CloudHatOpacity", c.cloudHatOpacity);
 				return;
 			}
 
@@ -2539,6 +2616,7 @@ namespace menu
 			    || row == ROW_S_TIMECYCLE   // the Scene page's master switch
 			    || row == ROW_S_WEATHER
 			    || row == ROW_S_BLENDTO
+			    || row == ROW_CLOUD_HAT // enables/disables Cloud Opacity
 			    // Selecting a different light re-reads every row below it, and
 			    // switching Point/Spot adds or removes the Cone Angle row.
 			    || row == ROW_L_SELECT

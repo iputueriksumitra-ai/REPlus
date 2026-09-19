@@ -117,7 +117,7 @@ All settings are in the editor. Open a marker's menu and find the
 
 | Where | Behaviour |
 |---|---|
-| Top-level marker menu | pages through global settings: **Curve**, **Limits**, **Scene**, **Scene Lights** |
+| Top-level marker menu | pages through global settings: **Curve**, **Limits**, **Scene**, **Scene Lights**, **Scene Clouds** |
 | Camera submenu | group switcher: Spline, **Depth of Field**, Shake, Shake Motion, 4 advanced pages |
 | **Export screen** | the renderer's own settings, under the stock Frame Rate and Bit rate |
 
@@ -381,6 +381,29 @@ as shot, and what the rows say matches what playback does.
 > is played, so the file on disk is untouched and a clip opened without the mod
 > is exactly as it was shot. That also means the look is a setting rather than
 > an edit: set a row back to *As Recorded* and it is gone.
+
+
+### Scene Clouds — WOW TEAM SCENE extension
+
+**Rockstar Editor+ → Scene Clouds** adds a runtime Cloud Hat override for FiveM
+Rockstar Editor playback and export. This exists because a GTA Cloud Hat is a
+separate runtime layer from the weather packet and is not reliably serialized
+into a `.clip`. A clip can therefore retain `CLOUDS` weather while losing an
+explicit `Cloudy 01` / `Nimbus` hat when it is opened in the editor.
+
+| Row | |
+|---|---|
+| **Cloud Hat** | **As Recorded** does nothing; otherwise forces one of the same GTA Cloud Hat names used by WOW TEAM SCENE, including `Cloudy 01`, `Nimbus`, `Wispy`, `Horizon`, `Puffs`, and the other stock hats |
+| **Cloud Opacity** | 0–100%, written only when the requested value changes |
+
+The bridge runs on FiveM's ScriptHookV game fiber. Its heartbeat only watches
+for editor entry/exit and setting changes: **`LOAD_CLOUD_HAT` is not called every
+frame**. This is deliberate. WOW TEAM SCENE V66/V67 testing showed that repeated
+cloud/time state writes can disturb natural cloud motion on graphics mods.
+
+When the override is disabled or the editor is left, the extension unloads the
+hat it forced and restores the cloud alpha captured before the override. The
+`.clip` file is never modified.
 
 ### Scene lights
 
@@ -1000,6 +1023,9 @@ Both files live in `RockstarEditorPlus\`, beside the `.asi`.
 | `WeatherBlend` | 0.0 | 0–1 between the two types |
 | `WeatherWetness` | -1 | 0–1 wet roads and puddles; -1 = as recorded |
 | `LiveTimecycle` | 1 | re-light for the overridden time/weather instead of replaying the clip's baked keyframe |
+| `OverrideCloudHat` | 0 | WOW extension: force a Cloud Hat while Rockstar Editor is active |
+| `CloudHatType` | 4 | index into the Scene Clouds list; 4 = `Cloudy 01` |
+| `CloudHatOpacity` | 1.0 | forced Cloud Hat opacity, 0–1 |
 | `ShakeDebugLog` `SplineDebugLog` `SplineTraceLog` | 0 | diagnostics |
 
 ### `Lights.ini`

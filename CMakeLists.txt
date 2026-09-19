@@ -165,6 +165,11 @@ WeatherBlend=0.0           ; 0..1 between WeatherType and WeatherBlendTo
 WeatherWetness=-1          ; 0..1 wet roads and puddles; -1 = as recorded
 LiveTimecycle=1            ; master switch. 0 keeps the clip's baked lighting
 
+; WOW TEAM SCENE - Cloud Hat playback overlay. Separate from Weather above.
+OverrideCloudHat=0         ; 1 = force CloudHatType while Rockstar Editor is active
+CloudHatType=4             ; index from the Scene Clouds page; 4 = Cloudy 01
+CloudHatOpacity=1.0        ; 0..1
+
 ; --- Recording length -------------------------------------------------------
 ReplayBlocks=128           ; 3..128. 128 = ~1m45 of city, ~604 MB. Restart first
 

@@ -1,4 +1,4 @@
-﻿// This file is part of RockstarEditorPlus.
+// This file is part of RockstarEditorPlus.
 // Copyright (C) 2026 CoreFX (crxhvrd@proton.me)
 // SPDX-License-Identifier: GPL-3.0-only
 // RockstarEditorPlus is free software: you can redistribute it and/or modify it
@@ -422,7 +422,10 @@ static bool ResolveScriptHook()
 	pScriptWait = reinterpret_cast<ScriptWaitFn>(
 		GetProcAddress(shv, "?scriptWait@@YAXK@Z"));
 
-	return pScriptRegister != nullptr && pScriptWait != nullptr;
+	const bool scriptOk = pScriptRegister != nullptr && pScriptWait != nullptr;
+	if (scriptOk)
+		cloudhat::bindScriptHook(shv);
+	return scriptOk;
 }
 
 // Entry point ScriptHookV calls on its fiber. A game thread, at a point where
@@ -434,11 +437,15 @@ static void ScriptThreadMain()
 
 	InstallOnce("ScriptHookV");
 
-	// Registered scripts are expected not to return; ScriptHookV re-enters one
-	// that does. Nothing here needs a tick, so park it on the longest wait
-	// rather than spinning per frame.
+	// WOW TEAM SCENE: Cloud Hats are a runtime layer that the replay does not
+	// reliably serialize. Keep a tiny game-fiber heartbeat solely to observe
+	// editor entry/exit and config changes. cloudhat::tick() is state/edge driven
+	// and DOES NOT re-load the hat every frame.
 	for (;;)
-		pScriptWait(0xFFFFFFFF);
+	{
+		cloudhat::tick();
+		pScriptWait(0);
+	}
 }
 
 // The FiveM start path.

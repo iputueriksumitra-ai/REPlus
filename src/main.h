@@ -1,4 +1,4 @@
-﻿// This file is part of RockstarEditorPlus.
+// This file is part of RockstarEditorPlus.
 // Copyright (C) 2026 CoreFX (crxhvrd@proton.me)
 // SPDX-License-Identifier: GPL-3.0-only
 // RockstarEditorPlus is free software: you can redistribute it and/or modify it
@@ -21,6 +21,7 @@
 #include "replay/limits.h"
 #include "replay/precache.h"
 #include "replay/scene.h"
+#include "replay/cloudhat.h"
 #include "ui/menu.h"
 #include "ui/exportmenu.h"
 

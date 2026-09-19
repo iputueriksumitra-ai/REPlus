@@ -445,6 +445,14 @@ struct Config
 	// rain has wet ground that a dry preset should not necessarily scrub off.
 	float weatherWetness = -1.0f;
 
+	// WOW TEAM SCENE - Cloud Hat overlay for Rockstar Editor playback.
+	// Cloud Hats are a separate runtime layer from CPacketWeather and are not
+	// reliably serialized into a .clip, so this override is applied live by the
+	// ScriptHookV game-thread bridge. Off means this extension touches nothing.
+	bool  overrideCloudHat = false;
+	int   cloudHatType = 4;          // Cloudy 01 in cloudhat.cpp's list
+	float cloudHatOpacity = 1.0f;    // 0..1
+
 	// A clip also records the fully RESOLVED timecycle keyframe every frame and
 	// replays it, which is why moving the clock on its own only moves the sun:
 	// the sky, ambient and fog are baked. On, the recorded keyframe is stood
@@ -1130,6 +1138,15 @@ struct Config
 		if (weatherBlend < 0.0f) weatherBlend = 0.0f;
 		if (weatherBlend > 1.0f) weatherBlend = 1.0f;
 		if (weatherWetness > 1.0f) weatherWetness = 1.0f;
+
+		overrideCloudHat = getBool("OverrideCloudHat", overrideCloudHat);
+		cloudHatType = GetPrivateProfileIntA("RockstarEditorPlus", "CloudHatType",
+			cloudHatType, ini.c_str());
+		cloudHatOpacity = getFloat("CloudHatOpacity", cloudHatOpacity);
+		if (cloudHatType < 0) cloudHatType = 0;
+		if (cloudHatOpacity < 0.0f) cloudHatOpacity = 0.0f;
+		if (cloudHatOpacity > 1.0f) cloudHatOpacity = 1.0f;
+
 		liveTimecycle = getBool("LiveTimecycle", liveTimecycle);
 
 		bypassProfanityFilter   = getBool("BypassProfanityFilter", bypassProfanityFilter);
