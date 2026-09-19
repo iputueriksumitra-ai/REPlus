@@ -34,8 +34,17 @@ jobs:
         run: |
           $sln = "_deps/simplecamera/external/IgcsConnector-main/src/IgcsConnector.sln"
           if (!(Test-Path $sln)) { throw "IgcsConnector solution not found: $sln" }
-          & msbuild $sln /m /p:Configuration=Release /p:Platform=x64
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (!(Test-Path $vswhere)) { throw "vswhere.exe not found" }
+
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          if (!$msbuild) { throw "MSBuild.exe not found by vswhere" }
+
+          Write-Host "Using MSBuild: $msbuild"
+          & $msbuild $sln /m /p:Configuration=Release /p:Platform=x64
           if ($LASTEXITCODE -ne 0) { throw "IgcsConnector build failed with exit code $LASTEXITCODE" }
+
           $addon = Get-ChildItem "_deps/simplecamera" -Recurse -Filter "IgcsConnector.addon64" | Select-Object -First 1
           if (!$addon) { throw "IgcsConnector.addon64 was not produced" }
           Write-Host "Capture bridge: $($addon.FullName)"
